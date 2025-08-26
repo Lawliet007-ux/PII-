@@ -2,287 +2,329 @@ import streamlit as st
 import re
 from datetime import datetime
 import pandas as pd
-from typing import List, Dict, Set, Any
+from typing import List, Dict, Set, Any, Tuple
 import json
 
-class SmartPIIExtractor:
+class IntelligentPIIExtractor:
     def __init__(self):
-        # Define field mappings with multiple language variants
-        self.field_patterns = {
-            'name': [
-                r'Name\s*\([^)]*\):\s*([A-Z][A-Z\s]+)',
-                r'नाव\):\s*([A-Z][A-Z\s]+)',
-                r'Father.*Name[^:]*:\s*([A-Z][A-Z\s]+)',
-                r'वडिलांचे.*नाव[^:]*:\s*([A-Z][A-Z\s]+)',
-            ],
-            'fir_number': [
-                r'FIR\s+No[^:]*:\s*(\d+)',
-                r'खब[^:]*:\s*(\d+)',
-            ],
-            'date': [
-                r'Date[^:]*:\s*(\d{1,2}/\d{1,2}/\d{4})',
-                r'दिनांक[^:]*:\s*(\d{1,2}/\d{1,2}/\d{4})',
-            ],
-            'time': [
-                r'Time[^:]*:\s*(\d{1,2}:\d{2})',
-                r'वेळ[^:]*:\s*(\d{1,2}:\d{2})',
-            ],
-            'police_station': [
-                r'P\.S\.[^:]*:\s*([^\n\\]+)',
-                r'पोलीस\s+ठाणे[^:]*:\s*([^\n\\]+)',
-            ],
-            'district': [
-                r'District[^:]*:\s*([^\n\\]+)',
-                r'जिल्हा[^:]*:\s*([^\n\\]+)',
-            ],
-            'address': [
-                r'Address[^:]*:\s*([^\n]+(?:\n[^a-zA-Z\n]+)*)',
-                r'पत्ता[^:]*:\s*([^\n]+(?:\n[^a-zA-Z\n]+)*)',
-            ],
-            'year': [
-                r'Year[^:]*:\s*(\d{4})',
-                r'वर्ष[^:]*:\s*(\d{4})',
-            ],
+        # Define what constitutes PII semantically
+        self.pii_indicators = {
+            'person_name': ['name', 'नाव', 'father', 'husband', 'वडिल', 'पती'],
+            'location': ['address', 'पत्ता', 'police station', 'पोलीस ठाणे', 'district', 'जिल्हा'],
+            'identifier': ['fir', 'case', 'entry', 'beat', 'phone', 'mobile'],
+            'temporal': ['date', 'time', 'दिनांक', 'वेळ', 'year', 'वर्ष'],
         }
     
-    def preprocess_text(self, text: str) -> str:
-        """Clean and normalize the input text"""
-        # Replace multiple spaces with single space
-        text = re.sub(r'\s+', ' ', text)
-        # Clean up common encoding issues
-        text = re.sub(r'[\\]+n', '\n', text)
-        # Normalize colons
-        text = re.sub(r':\s*', ': ', text)
-        return text.strip()
+    def parse_text_semantically(self, text: str) -> Dict[str, Any]:
+        """Parse text line by line with semantic understanding"""
+        lines = text.strip().split('\n')
+        extracted_data = {
+            'names': [],
+            'addresses': [],
+            'phone_numbers': [],
+            'dates': [],
+            'times': [],
+            'fir_numbers': [],
+            'case_numbers': [],
+            'police_stations': [],
+            'districts': [],
+            'years': [],
+            'entry_numbers': [],
+            'beat_numbers': [],
+            'other_identifiers': []
+        }
+        
+        for line_num, line in enumerate(lines):
+            line = line.strip()
+            if not line or len(line) < 3:
+                continue
+                
+            # Analyze this line for PII
+            pii_data = self.analyze_line_for_pii(line, line_num, lines)
+            
+            # Merge results
+            for category, values in pii_data.items():
+                if values and category in extracted_data:
+                    extracted_data[category].extend(values)
+        
+        # Clean and deduplicate
+        return self.clean_extracted_data(extracted_data)
     
-    def extract_field_values(self, text: str) -> Dict[str, List[str]]:
-        """Extract values using field-based approach"""
+    def analyze_line_for_pii(self, line: str, line_num: int, all_lines: List[str]) -> Dict[str, List[str]]:
+        """Analyze a single line for PII using semantic understanding"""
+        pii_found = {}
+        
+        # Case 1: Field-value pairs (most common in forms)
+        if ':' in line:
+            pii_found.update(self.extract_field_value_pairs(line))
+        
+        # Case 2: Standalone values that look like PII
+        pii_found.update(self.extract_standalone_pii(line))
+        
+        # Case 3: Multi-line values (addresses often span multiple lines)
+        if line_num < len(all_lines) - 1:
+            pii_found.update(self.extract_multiline_pii(line, all_lines[line_num + 1:line_num + 3]))
+        
+        return pii_found
+    
+    def extract_field_value_pairs(self, line: str) -> Dict[str, List[str]]:
+        """Extract PII from field:value pairs"""
         results = {}
         
-        # Preprocess text
-        clean_text = self.preprocess_text(text)
+        # Split on colon
+        if ':' not in line:
+            return results
+            
+        parts = line.split(':', 1)
+        if len(parts) != 2:
+            return results
+            
+        field_part = parts[0].strip().lower()
+        value_part = parts[1].strip()
         
-        for field_type, patterns in self.field_patterns.items():
-            values = set()
-            
-            for pattern in patterns:
-                matches = re.findall(pattern, clean_text, re.MULTILINE | re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    
-                    # Clean the extracted value
-                    cleaned_match = self.clean_extracted_value(match, field_type)
-                    if cleaned_match:
-                        values.add(cleaned_match)
-            
-            if values:
-                results[field_type] = list(values)
+        if not value_part or len(value_part) < 2:
+            return results
+        
+        # Determine what type of PII this is based on field name
+        pii_type = self.classify_field_type(field_part)
+        
+        if pii_type:
+            # Extract the actual value
+            clean_value = self.clean_value_by_type(value_part, pii_type)
+            if clean_value:
+                results[pii_type] = [clean_value]
         
         return results
     
-    def clean_extracted_value(self, value: str, field_type: str) -> str:
-        """Clean and validate extracted values"""
+    def classify_field_type(self, field_text: str) -> str:
+        """Classify what type of PII a field contains based on its label"""
+        field_text = field_text.lower()
+        
+        # Name fields
+        if any(indicator in field_text for indicator in ['name', 'नाव']):
+            return 'names'
+        
+        # Address fields  
+        if any(indicator in field_text for indicator in ['address', 'पत्ता', 'occurrence', 'घटना']):
+            return 'addresses'
+        
+        # Phone fields
+        if any(indicator in field_text for indicator in ['phone', 'mobile', 'contact']):
+            return 'phone_numbers'
+        
+        # Date fields
+        if any(indicator in field_text for indicator in ['date', 'दिनांक']):
+            return 'dates'
+        
+        # Time fields
+        if any(indicator in field_text for indicator in ['time', 'वेळ']):
+            return 'times'
+        
+        # FIR fields
+        if 'fir' in field_text or 'खब' in field_text:
+            return 'fir_numbers'
+        
+        # Case fields
+        if 'case' in field_text:
+            return 'case_numbers'
+        
+        # Police station fields
+        if any(indicator in field_text for indicator in ['p.s.', 'police station', 'पोलीस ठाणे']):
+            return 'police_stations'
+        
+        # District fields
+        if any(indicator in field_text for indicator in ['district', 'जिल्हा']):
+            return 'districts'
+        
+        # Year fields
+        if any(indicator in field_text for indicator in ['year', 'वर्ष']):
+            return 'years'
+        
+        # Entry number fields
+        if 'entry' in field_text or 'नोंद' in field_text:
+            return 'entry_numbers'
+        
+        # Beat number fields
+        if 'beat' in field_text or 'बीट' in field_text:
+            return 'beat_numbers'
+        
+        return None
+    
+    def clean_value_by_type(self, value: str, pii_type: str) -> str:
+        """Clean extracted value based on its PII type"""
         if not value:
             return ""
         
-        # Basic cleaning
+        # Remove common prefixes and suffixes
+        value = re.sub(r'^[^\w\u0900-\u097F]+', '', value)  # Remove leading non-word chars
+        value = re.sub(r'[^\w\u0900-\u097F\s:/.-]+$', '', value)  # Remove trailing junk
         value = value.strip()
-        value = re.sub(r'\\n.*$', '', value)  # Remove everything after \n
-        value = re.sub(r'\s+', ' ', value)    # Normalize spaces
         
-        # Type-specific cleaning
-        if field_type == 'name':
-            # Must be reasonable name format
-            if len(value) < 4 or len(value) > 50:
-                return ""
-            if not re.match(r'^[A-Z][A-Z\s]*$', value):
-                return ""
-            # Remove common false positives
-            false_positives = ['NAME OF', 'TIME OF', 'DATE AND', 'PLACE OF', 'TYPE OF']
-            if value.strip() in false_positives:
-                return ""
+        if pii_type == 'names':
+            # Names should be mostly letters and spaces
+            if re.match(r'^[A-Z][A-Z\s]{2,49}$', value):
+                return value
         
-        elif field_type in ['police_station', 'district']:
-            # Remove leading symbols and clean
-            value = re.sub(r'^[^\w\u0900-\u097F]*', '', value)
-            if len(value) < 2:
-                return ""
+        elif pii_type == 'dates':
+            # Extract date pattern
+            date_match = re.search(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', value)
+            if date_match:
+                return date_match.group(1)
         
-        elif field_type == 'address':
-            # Must be reasonable address length
-            if len(value) < 10 or len(value) > 200:
-                return ""
+        elif pii_type == 'times':
+            # Extract time pattern
+            time_match = re.search(r'\b(\d{1,2}:\d{2})\b', value)
+            if time_match:
+                return time_match.group(1)
         
-        elif field_type == 'date':
-            # Validate date format
-            if not re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', value):
-                return ""
+        elif pii_type == 'phone_numbers':
+            # Extract phone number
+            phone_match = re.search(r'(\+?91?[\s-]?[6-9]\d{9})', value)
+            if phone_match:
+                return phone_match.group(1)
         
-        elif field_type == 'time':
-            # Validate time format
-            if not re.match(r'^\d{1,2}:\d{2}$', value):
-                return ""
+        elif pii_type in ['fir_numbers', 'case_numbers', 'entry_numbers', 'beat_numbers']:
+            # Extract numeric identifiers
+            num_match = re.search(r'\b(\d+(?:/\d+)?)\b', value)
+            if num_match:
+                return num_match.group(1)
         
-        return value.strip()
+        elif pii_type == 'years':
+            # Extract 4-digit year
+            year_match = re.search(r'\b(20\d{2}|19\d{2})\b', value)
+            if year_match:
+                return year_match.group(1)
+        
+        elif pii_type in ['police_stations', 'districts', 'addresses']:
+            # For location data, clean but preserve
+            if len(value) > 2 and len(value) < 200:
+                return value
+        
+        return ""
     
-    def extract_additional_patterns(self, text: str) -> Dict[str, List[str]]:
-        """Extract additional PII using pattern matching"""
-        additional_pii = {}
+    def extract_standalone_pii(self, line: str) -> Dict[str, List[str]]:
+        """Extract PII from standalone values (not field:value pairs)"""
+        results = {}
+        
+        # Look for patterns that indicate PII even without field labels
+        
+        # Standalone dates
+        date_matches = re.findall(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', line)
+        if date_matches:
+            results['dates'] = date_matches
+        
+        # Standalone times  
+        time_matches = re.findall(r'\b(\d{1,2}:\d{2})\s*(?:तास|वाजता|AM|PM)?', line)
+        if time_matches:
+            results['times'] = time_matches
         
         # Phone numbers
-        phone_patterns = [
-            r'\+91[\s-]?([6-9]\d{9})',
-            r'\b([6-9]\d{9})\b',
-            r'Phone[^:]*:\s*(\+?91?[\s-]?[6-9]\d{9})',
-        ]
+        phone_matches = re.findall(r'\b(\+?91[\s-]?[6-9]\d{9})\b', line)
+        if phone_matches:
+            results['phone_numbers'] = phone_matches
         
-        phones = set()
-        for pattern in phone_patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0]
-                if len(match) >= 10:
-                    phones.add(match)
+        # 4-digit years
+        year_matches = re.findall(r'\b(20\d{2})\b', line)
+        if year_matches:
+            results['years'] = year_matches
         
-        if phones:
-            additional_pii['phone_numbers'] = list(phones)
-        
-        # Entry numbers
-        entry_matches = re.findall(r'Entry\s+No[^:]*:\s*(\d+)', text, re.IGNORECASE)
-        if entry_matches:
-            additional_pii['entry_numbers'] = entry_matches
-        
-        # Beat numbers  
-        beat_matches = re.findall(r'Beat\s+No[^:]*:\s*(\d+)', text, re.IGNORECASE)
-        if beat_matches:
-            additional_pii['beat_numbers'] = beat_matches
-        
-        # Section numbers
-        section_matches = re.findall(r'Section(?:s)?\s*[^:]*:\s*(\d+(?:\(\d+\))?)', text, re.IGNORECASE)
-        if section_matches:
-            additional_pii['legal_sections'] = section_matches
-        
-        return additional_pii
+        return results
     
-    def extract_contextual_entities(self, text: str) -> Dict[str, List[str]]:
-        """Extract entities using contextual understanding"""
-        entities = {}
+    def extract_multiline_pii(self, current_line: str, next_lines: List[str]) -> Dict[str, List[str]]:
+        """Extract PII that spans multiple lines (like addresses)"""
+        results = {}
         
-        # Look for standalone proper nouns that might be names
-        lines = text.split('\n')
-        potential_names = set()
+        # If current line ends with a field indicator, next line might have the value
+        if current_line.lower().endswith(('address', 'पत्ता', 'occurrence')):
+            if next_lines:
+                next_line = next_lines[0].strip()
+                if next_line and len(next_line) > 5:
+                    # This might be an address
+                    clean_addr = self.clean_value_by_type(next_line, 'addresses')
+                    if clean_addr:
+                        results['addresses'] = [clean_addr]
         
-        for line in lines:
-            # Skip lines that are clearly field labels
-            if ':' in line and any(keyword in line.lower() for keyword in ['name', 'नाव', 'father', 'वडिल']):
-                # Extract value after colon
-                parts = line.split(':', 1)
-                if len(parts) > 1:
-                    value = parts[1].strip()
-                    if re.match(r'^[A-Z][A-Z\s]{3,40}$', value):
-                        potential_names.add(value)
-        
-        if potential_names:
-            entities['extracted_names'] = list(potential_names)
-        
-        # Look for Indian city names
-        indian_cities = ['पुणे', 'मुंबई', 'दिल्ली', 'भोसरी', 'कोल्हापूर', 'नागपूर', 'औरंगाबाद']
-        found_cities = []
-        for city in indian_cities:
-            if city in text:
-                found_cities.append(city)
-        
-        if found_cities:
-            entities['cities'] = found_cities
-        
-        return entities
+        return results
     
-    def extract_all_pii(self, text: str) -> Dict[str, List[str]]:
-        """Main extraction method combining all approaches"""
-        all_pii = {}
+    def clean_extracted_data(self, data: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """Final cleanup and deduplication"""
+        cleaned = {}
         
-        # Method 1: Field-based extraction
-        field_pii = self.extract_field_values(text)
-        all_pii.update(field_pii)
+        for category, values in data.items():
+            if not values:
+                continue
+                
+            # Remove duplicates and empty values
+            unique_values = []
+            seen = set()
+            
+            for value in values:
+                value = str(value).strip()
+                if value and value not in seen and len(value) > 1:
+                    seen.add(value)
+                    unique_values.append(value)
+            
+            if unique_values:
+                cleaned[category] = unique_values
         
-        # Method 2: Additional pattern matching
-        additional_pii = self.extract_additional_patterns(text)
-        all_pii.update(additional_pii)
-        
-        # Method 3: Contextual entity extraction
-        contextual_pii = self.extract_contextual_entities(text)
-        all_pii.update(contextual_pii)
-        
-        return all_pii
+        return cleaned
+    
+    def extract_pii(self, text: str) -> Dict[str, List[str]]:
+        """Main extraction method"""
+        return self.parse_text_semantically(text)
 
 def main():
     st.set_page_config(
-        page_title="Smart PII Extractor",
-        page_icon="🔍",
+        page_title="Intelligent PII Extractor",
+        page_icon="🧠",
         layout="wide"
     )
     
-    st.title("🔍 Smart PII Extractor Tool")
-    st.markdown("Advanced Personal Identifiable Information extraction using NLP techniques")
+    st.title("🧠 Intelligent PII Extractor")
+    st.markdown("**Semantic understanding approach** - Analyzes text like a human would")
     
-    # Initialize extractor
-    extractor = SmartPIIExtractor()
+    extractor = IntelligentPIIExtractor()
     
     # Sidebar
     with st.sidebar:
-        st.header("📋 Extraction Methods")
+        st.header("🧠 How It Works")
         st.markdown("""
-        **🎯 Field-Based Extraction**
-        - Targets specific form fields
-        - Multi-language support
-        - Context-aware cleaning
+        **Line-by-Line Analysis**
+        - Reads each line semantically
+        - Identifies field-value relationships
+        - Understands context and meaning
         
-        **🔍 Pattern Recognition**
-        - Phone numbers
-        - Reference numbers
-        - Legal sections
+        **Smart Classification**
+        - Recognizes field types by labels
+        - Handles multi-language content  
+        - Extracts actual values, not labels
         
-        **🧠 Contextual Analysis**
-        - Proper noun detection
-        - Geographic entities
-        - Relationship mapping
+        **Contextual Cleaning**
+        - Type-specific validation
+        - Removes formatting artifacts
+        - Preserves meaningful data
         """)
         
-        st.header("🔧 Detected Categories")
-        st.markdown("""
-        - **Names**: Person names
-        - **Dates & Times**: Timestamps
-        - **FIR Numbers**: Case references
-        - **Police Stations**: Jurisdiction
-        - **Districts**: Geographic regions
-        - **Addresses**: Physical locations
-        - **Phone Numbers**: Contact info
-        - **Legal Sections**: Act references
-        """)
+        st.header("📊 Debug Mode")
+        debug_mode = st.checkbox("Show line-by-line analysis")
     
-    # Main interface
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.header("📝 Input Text")
+        st.header("📝 Input")
         
-        # Sample FIR text
+        # Enhanced sample with clear formatting
         sample_text = """P.S. (पोलीस ठाणे): भोसरी
 FIR No. (FIR खब Đ.): 0523
-Date and Time of FIR (FIR ख. दिनांक आणण वेळ): 19/11/2017 21:33 वाजता
+Date and Time of FIR: 19/11/2017 21:33 वाजता
 District (जिल्हा): पुणे शहर
 Year (वर्ष): 2017
 
-Complainant / Informant (तक्रारदार / माहिती देणारा):
-(a) Name (नाव): VIPUL RANGNATH JADHAV
-(b) Father's/Husband's Name (वडिलांचे/पतीचे नाव): RANGNATH JADHAV
+Name (नाव): VIPUL RANGNATH JADHAV
+Father's Name (वडिलांचे नाव): RANGNATH JADHAV
 
-Place of Occurrence (घटनास्थळ):
 Address (पत्ता): अशोक हॉटेल्या पाठीमागे, मोरया मंदिरात, राशिवाटा, वासारवाडी, पुणे
 
-Information received at P.S. (पोलीस ठाण्यावर माहिती मिळाल्याचा):
 Date (दिनांक): 19/11/2017
 Time (वेळ): 21:09 तास
 
@@ -292,119 +334,98 @@ Beat No. (बीट Đ.): 1
 Phone: +91 9876543210
 Case No: 123/2017"""
         
-        # Input methods
-        input_method = st.radio("Choose input method:", ["Paste Text", "Use Sample", "Upload File"])
+        input_method = st.radio("Input method:", ["Sample Text", "Custom Text", "File Upload"])
         
-        if input_method == "Use Sample":
+        if input_method == "Sample Text":
             text_input = sample_text
-            st.text_area("Sample FIR text:", text_input, height=400, disabled=True)
-        elif input_method == "Paste Text":
-            text_input = st.text_area("Paste your text here:", height=400)
+            st.text_area("Sample:", text_input, height=350, disabled=True)
+        elif input_method == "Custom Text":
+            text_input = st.text_area("Enter your text:", height=350)
         else:
-            uploaded_file = st.file_uploader("Upload text file:", type=['txt', 'log'])
+            uploaded_file = st.file_uploader("Upload file:", type=['txt'])
             if uploaded_file:
                 text_input = str(uploaded_file.read(), "utf-8")
-                st.text_area("File content:", text_input[:500] + "...", height=200)
+                st.text_area("File content:", text_input[:400] + "...", height=200)
             else:
                 text_input = ""
     
     with col2:
-        st.header("🎯 Extracted PII")
+        st.header("🎯 Results")
         
         if st.button("🚀 Extract PII", type="primary") and text_input:
-            with st.spinner("Processing with smart extraction..."):
-                # Extract PII
-                pii_results = extractor.extract_all_pii(text_input)
+            with st.spinner("Analyzing text semantically..."):
+                results = extractor.extract_pii(text_input)
                 
-                if pii_results:
-                    st.success(f"✅ Found PII in {len(pii_results)} categories")
+                if results:
+                    st.success(f"🎉 Found {sum(len(v) for v in results.values())} PII items in {len(results)} categories")
                     
-                    # Display results in tabs
-                    tab1, tab2, tab3 = st.tabs(["📊 Results", "🔍 Details", "💾 Export"])
-                    
-                    with tab1:
-                        st.subheader("📊 Extraction Results")
-                        
-                        for category, values in pii_results.items():
-                            with st.expander(f"**{category.replace('_', ' ').title()}** ({len(values)} items)", expanded=True):
-                                for i, value in enumerate(values, 1):
-                                    st.write(f"**{i}.** `{value}`")
-                    
-                    with tab2:
-                        st.subheader("🔍 Detailed Analysis")
-                        
-                        # Create structured view
-                        for category, values in pii_results.items():
-                            st.write(f"**{category.replace('_', ' ').title()}:**")
-                            df = pd.DataFrame({
-                                'Value': values,
-                                'Length': [len(v) for v in values],
-                                'Type': [category] * len(values)
-                            })
-                            st.dataframe(df, use_container_width=True)
+                    # Show results
+                    for category, items in results.items():
+                        if items:
+                            st.subheader(f"📋 {category.replace('_', ' ').title()}")
+                            for i, item in enumerate(items, 1):
+                                st.write(f"**{i}.** `{item}`")
                             st.write("---")
                     
-                    with tab3:
-                        st.subheader("💾 Export Options")
-                        
-                        # Prepare export data
-                        export_rows = []
-                        for category, values in pii_results.items():
-                            for value in values:
-                                export_rows.append({
-                                    'Category': category.replace('_', ' ').title(),
-                                    'Value': value,
-                                    'Length': len(value),
-                                    'Extracted_At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                })
-                        
-                        if export_rows:
-                            df_export = pd.DataFrame(export_rows)
-                            
-                            col_e1, col_e2 = st.columns(2)
-                            
-                            with col_e1:
-                                # CSV export
-                                csv = df_export.to_csv(index=False)
-                                st.download_button(
-                                    "📥 Download CSV",
-                                    csv,
-                                    f"smart_pii_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                    "text/csv"
-                                )
-                            
-                            with col_e2:
-                                # JSON export
-                                json_data = json.dumps(pii_results, indent=2, ensure_ascii=False)
-                                st.download_button(
-                                    "📥 Download JSON",
-                                    json_data,
-                                    f"smart_pii_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                    "application/json"
-                                )
-                            
-                            st.dataframe(df_export, use_container_width=True)
+                    # Export section
+                    st.subheader("💾 Export")
                     
-                    # Summary metrics
-                    total_items = sum(len(values) for values in pii_results.values())
-                    col_m1, col_m2, col_m3 = st.columns(3)
+                    # Prepare export data
+                    export_data = []
+                    for category, items in results.items():
+                        for item in items:
+                            export_data.append({
+                                'Category': category.replace('_', ' ').title(),
+                                'Value': item,
+                                'Length': len(item)
+                            })
                     
-                    with col_m1:
-                        st.metric("Total PII Items", total_items)
-                    with col_m2:
-                        st.metric("Categories", len(pii_results))
-                    with col_m3:
-                        st.metric("Text Length", f"{len(text_input):,} chars")
+                    if export_data:
+                        df = pd.DataFrame(export_data)
+                        
+                        col_e1, col_e2 = st.columns(2)
+                        
+                        with col_e1:
+                            csv = df.to_csv(index=False)
+                            st.download_button(
+                                "📥 CSV",
+                                csv,
+                                f"intelligent_pii_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                            )
+                        
+                        with col_e2:
+                            json_str = json.dumps(results, indent=2, ensure_ascii=False)
+                            st.download_button(
+                                "📥 JSON", 
+                                json_str,
+                                f"intelligent_pii_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                            )
+                        
+                        st.dataframe(df, use_container_width=True)
                 
                 else:
-                    st.warning("⚠️ No PII detected. Please check your input text.")
+                    st.warning("No PII found. The text might not contain recognizable PII patterns.")
+                
+                # Debug mode
+                if debug_mode:
+                    st.subheader("🔍 Debug: Line Analysis")
+                    lines = text_input.strip().split('\n')
+                    for i, line in enumerate(lines):
+                        if line.strip():
+                            st.write(f"**Line {i+1}:** `{line}`")
+                            line_pii = extractor.analyze_line_for_pii(line, i, lines)
+                            if line_pii:
+                                st.json(line_pii)
+                            else:
+                                st.write("_No PII detected_")
+                            st.write("---")
         
         elif not text_input:
-            st.info("👆 Select an input method and provide text to extract PII")
+            st.info("👆 Choose input method and provide text")
     
     # Footer
-    st.markdown("---")
-    st.markdown("**Smart PII Extractor** - Uses advanced NLP techniques for accurate PII detection from legal documents")
+    st.markdown("---") 
+    st.markdown("**Intelligent PII Extractor** - Uses semantic analysis instead of regex patterns")
 
 if __name__ == "__main__":
     main()
