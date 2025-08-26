@@ -6,55 +6,75 @@ from typing import List, Dict, Set
 
 class PIIExtractor:
     def __init__(self):
-        # Patterns for different types of PII
+        # More precise patterns for different types of PII
         self.patterns = {
             'names': [
-                r'\b[A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+\b',  # Full names (3 parts)
-                r'\b[A-Z][a-z]+ [A-Z][a-z]+\b',  # Full names (2 parts)
-                r'Name \(नाव\):\s*([A-Z\s]+)',  # Specific pattern from FIR
-                r'नाव:\s*([A-Z\s]+)',  # Hindi pattern
+                r'Name\s*\([^)]*\):\s*([A-Z][A-Z\s]{5,50})',  # Name field extraction
+                r'नाव\):\s*([A-Z][A-Z\s]{5,50})',  # Hindi name field
+                r"Father's/Husband's Name[^:]*:\s*([A-Z][A-Z\s]{5,50})",  # Father/Husband name
+                r'वडिलांचे/पिचे नाव[^:]*:\s*([A-Z][A-Z\s]{5,50})',  # Hindi Father/Husband
+                r'Complainant[^:]*:\s*([A-Z][A-Z\s]{5,50})',  # Complainant name
+                # Only capture standalone names with 2-3 words
+                r'\b([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15}(?:\s+[A-Z][a-z]{2,15})?)\b',
             ],
             'dates': [
-                r'\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b',  # DD/MM/YYYY or DD-MM-YYYY
-                r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b',  # YYYY/MM/DD or YYYY-MM-DD
-                r'Date \(दिनांक\):\s*(\d{1,2}/\d{1,2}/\d{4})',  # Specific FIR date pattern
-                r'दिनांक:\s*(\d{1,2}/\d{1,2}/\d{4})',  # Hindi date pattern
+                r'\b(\d{1,2}/\d{1,2}/\d{4})\b',  # Standard date format
+                r'(\d{1,2}-\d{1,2}-\d{4})',  # Date with dashes
+                r'(\d{4}/\d{1,2}/\d{1,2})',  # ISO-ish format
             ],
             'addresses': [
-                r'Address \(पत्ता\):\s*([^,\n]+(?:,[^,\n]+)*)',  # Address pattern from FIR
-                r'पत्ता:\s*([^,\n]+(?:,[^,\n]+)*)',  # Hindi address pattern
-                r'\b(?:पुणे|मुंबई|दिल्ली|कोल्हापूर|नागपूर|औरंगाबाद)\b',  # Indian cities
-                r'\b\d{6}\b',  # PIN codes
+                r'Address\s*\([^)]*\):\s*([^\\n,]+(?:,[^\\n,]+)*)',  # Address field
+                r'पत्ता\):\s*([^\\n,]+(?:,[^\\n,]+)*)',  # Hindi address
+                r'([\w\s]+(?:,\s*[\w\s]+){2,}(?:,\s*पुणे|,\s*मुंबई|,\s*दिल्ली)?)',  # Multi-part address
             ],
             'phone_numbers': [
-                r'\b(?:\+91|91)?\s*[6-9]\d{9}\b',  # Indian mobile numbers
-                r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',  # General phone pattern
+                r'\b(\+91[\s-]?[6-9]\d{9})\b',  # Indian mobile with +91
+                r'\b(91[\s-]?[6-9]\d{9})\b',  # Indian mobile with 91
+                r'\b([6-9]\d{9})\b',  # 10-digit Indian mobile
+                r'\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})\b',  # General phone format
             ],
             'fir_numbers': [
-                r'FIR No\.\s*\([^)]+\):\s*(\d+)',  # FIR number pattern
-                r'FIR\s*(?:No|Number)\.?\s*:?\s*(\d+)',  # Alternative FIR patterns
+                r'FIR\s+No[^:]*:\s*(\d+)',  # FIR number extraction
+                r'खब[^:]*:\s*(\d+)',  # Hindi FIR number
             ],
             'case_numbers': [
-                r'Case No\.\s*:?\s*(\d+/\d{4})',  # Case number pattern
-                r'केस नं\.:\s*(\d+/\d{4})',  # Hindi case number
+                r'Case\s+No[^:]*:\s*(\d+/\d{4})',  # Case number
+                r'केस\s+नं[^:]*:\s*(\d+/\d{4})',  # Hindi case number
             ],
             'police_stations': [
-                r'P\.S\.\s*\([^)]+\):\s*([^,\n]+)',  # Police station from FIR
-                r'Police Station:\s*([^,\n]+)',  # Alternative police station
-                r'पोलीस ठाणे:\s*([^,\n]+)',  # Hindi police station
+                r'P\.S\.\s*\([^)]*\):\s*([^\\\n]+?)(?:\\\n|$)',  # Police station
+                r'पोलीस ठाणे\):\s*([^\\\n]+?)(?:\\\n|$)',  # Hindi police station
             ],
             'districts': [
-                r'District \([^)]+\):\s*([^,\n]+)',  # District from FIR
-                r'जिल्हा:\s*([^,\n]+)',  # Hindi district
+                r'District\s*\([^)]*\):\s*([^\\\n]+?)(?:\\\n|$)',  # District
+                r'जिल्हा\):\s*([^\\\n]+?)(?:\\\n|$)',  # Hindi district
             ],
             'times': [
-                r'\b\d{1,2}:\d{2}\s*(?:AM|PM|तास|वाजता)?\b',  # Time patterns
-                r'Time \([^)]+\):\s*(\d{1,2}:\d{2}[^,\n]*)',  # Time from FIR
+                r'\b(\d{1,2}:\d{2})\s*(?:तास|वाजता|AM|PM|hours?)?',  # Time extraction
+            ],
+            'years': [
+                r'Year\s*\([^)]*\):\s*(\d{4})',  # Year field
+                r'वर्ष\):\s*(\d{4})',  # Hindi year
+                r'\b(20\d{2})\b',  # Standalone years
+            ],
+            'entry_numbers': [
+                r'Entry\s+No[^:]*:\s*(\d+)',  # Entry number
+                r'नɉि[^:]*:\s*(\d+)',  # Hindi entry number
+            ],
+            'beat_numbers': [
+                r'Beat\s+No[^:]*:\s*(\d+)',  # Beat number
+                r'बिट[^:]*:\s*(\d+)',  # Hindi beat number
+            ],
+            'sections': [
+                r'Sections?\s*\([^)]*\):\s*(\d+(?:\(\d+\))?)',  # Legal sections
+                r'कलम\):\s*(\d+(?:\(\d+\))?)',  # Hindi sections
+            ],
+            'pin_codes': [
+                r'\b(\d{6})\b',  # 6-digit PIN codes
             ],
             'identification_numbers': [
-                r'\b[A-Z]{2}\d{2}[A-Z]{2}\d{4}\b',  # Vehicle number pattern
-                r'\b\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\b',  # Card numbers (masked)
-                r'\b[A-Z]{5}\d{4}[A-Z]\b',  # PAN card pattern
+                r'\b([A-Z]{2}\d{2}[A-Z]{2}\d{4})\b',  # Vehicle numbers
+                r'\b([A-Z]{5}\d{4}[A-Z])\b',  # PAN numbers
             ]
         }
     
