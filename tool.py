@@ -1,5 +1,9 @@
+# tool.py
+import streamlit as st
 import re
 from rapidfuzz import fuzz
+
+st.set_page_config(page_title="PII Extractor", layout="wide")
 
 # ------------------- Regex Patterns -------------------
 REGEX_PATTERNS = {
@@ -35,39 +39,6 @@ def gazetteer_extract(text):
                 out.append({"label": label, "text": w, "confidence": 0.98})
     return out
 
-def clean_ner_output(ner_results):
-    """Merge subwords & filter junk"""
-    cleaned = []
-    buffer = []
-    current_label = None
-    
-    for ent in ner_results:
-        if ent["score"] < 0.75:  # discard weak predictions
-            continue
-        word = ent["word"].replace("##", "").strip()
-        if len(word) <= 2:  # drop tiny fragments
-            continue
-
-        if ent["entity_group"] != current_label:
-            if buffer:
-                cleaned.append({
-                    "label": current_label,
-                    "text": " ".join(buffer),
-                    "confidence": round(float(ent["score"]), 3)
-                })
-            buffer = [word]
-            current_label = ent["entity_group"]
-        else:
-            buffer.append(word)
-
-    if buffer:
-        cleaned.append({
-            "label": current_label,
-            "text": " ".join(buffer),
-            "confidence": 0.9
-        })
-    return cleaned
-
 def merge_results(*sources):
     final = []
     for src in sources:
@@ -76,11 +47,25 @@ def merge_results(*sources):
                 final.append(r)
     return final
 
-def extract_pii(text, ner_model=None):
+def extract_pii(text):
     regex_hits = regex_extract(text)
     gazette_hits = gazetteer_extract(text)
-    ner_hits = []
-    if ner_model:
-        ents = ner_model(text)
-        ner_hits = clean_ner_output(ents)
-    return merge_results(regex_hits, gazette_hits, ner_hits)
+    return merge_results(regex_hits, gazette_hits)
+
+# ------------------- Streamlit UI -------------------
+st.title("🔎 PII Extractor (Hybrid Model)")
+st.write("Extract Aadhaar, PAN, Phone, Email, FIR No., Date/Time, PIN, Gazetteer locations etc.")
+
+user_input = st.text_area("Paste FIR / Legal Text Here", height=200)
+
+if st.button("Extract PII"):
+    if not user_input.strip():
+        st.warning("⚠️ Please paste some text first.")
+    else:
+        results = extract_pii(user_input)
+        if results:
+            st.success(f"✅ Found {len(results)} PII entities")
+            for r in results:
+                st.json(r)
+        else:
+            st.error("❌ No PII found in the text.")
