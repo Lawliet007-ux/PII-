@@ -1,12 +1,11 @@
-# tool.py
 import streamlit as st
 import re
-from rapidfuzz import fuzz
+import json
 from transformers import pipeline
 
-st.set_page_config(page_title="PII Extractor (Best Hybrid)", layout="wide")
+st.set_page_config(page_title="Advanced PII Extractor", layout="wide")
 
-# ---------------- Regex Patterns ----------------
+# Regex patterns (same as before, extended)
 REGEX_PATTERNS = {
     "aadhaar": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
     "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -21,21 +20,14 @@ REGEX_PATTERNS = {
     "pin": r"\b\d{6}\b"
 }
 
-# ---------------- Gazetteer ----------------
-GAZETTEER = {
-    "state": ["Maharashtra", "Delhi", "Karnataka", "Goa", "Gujarat", "Tamil Nadu"],
-    "district": ["Pune", "Nagpur", "Mumbai", "Bhosari", "Thane", "Bangalore"],
-    "police": ["Police Station", "PS", "Bhosari Police Station", "Delhi Police"]
-}
-
-# ---------------- HuggingFace NER ----------------
+# IndicNER model (better than XLM-R for Indian PII)
 @st.cache_resource
 def load_ner():
-    return pipeline("ner", model="Davlan/xlm-roberta-base-ner-hrl", aggregation_strategy="simple")
+    return pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
 
 ner_model = load_ner()
 
-# ---------------- Extractors ----------------
+# --- Regex extractor ---
 def regex_extract(text):
     out = []
     for label, pat in REGEX_PATTERNS.items():
@@ -43,55 +35,59 @@ def regex_extract(text):
             out.append({"label": label, "text": m.group().strip(), "confidence": 0.99})
     return out
 
-def gazetteer_extract(text):
-    out = []
-    for label, words in GAZETTEER.items():
-        for w in words:
-            if re.search(rf"\b{re.escape(w)}\b", text, flags=re.IGNORECASE):
-                out.append({"label": label, "text": w, "confidence": 0.98})
-    return out
-
+# --- NER extractor ---
 def ner_extract(text):
-    entities = ner_model(text)
+    ents = ner_model(text)
     out = []
-    for ent in entities:
-        label = ent["entity_group"]
-        if label in ["PER", "ORG", "LOC"]:
+    for ent in ents:
+        if ent["entity_group"] in ["PER", "LOC", "ORG"]:
             out.append({
-                "label": label.lower(),
+                "label": ent["entity_group"].lower(),
                 "text": ent["word"],
                 "confidence": float(ent["score"])
             })
     return out
 
-def merge_results(*sources):
-    final = []
-    for src in sources:
-        for r in src:
-            if not any(fuzz.ratio(r["text"].lower(), f["text"].lower()) > 90 for f in final):
-                final.append(r)
-    return final
+# --- LLM-based structured extraction ---
+from transformers import pipeline as hf_pipeline
+llm = hf_pipeline("text2text-generation", model="google/flan-t5-large")  # lightweight
 
+def llm_extract(text):
+    prompt = f"""
+    Extract all Personal Identifiable Information (PII) from the following text.
+    Return JSON with keys: Names, Addresses, IDs, Contacts, PoliceStations, Dates.
+    
+    Text: {text}
+    """
+    response = llm(prompt, max_new_tokens=512)[0]["generated_text"]
+    try:
+        data = json.loads(response)
+        out = []
+        for key, vals in data.items():
+            for v in vals:
+                out.append({"label": key.lower(), "text": v, "confidence": 0.95})
+        return out
+    except:
+        return []
+
+# --- Merge ---
 def extract_pii(text):
     regex_hits = regex_extract(text)
-    gazette_hits = gazetteer_extract(text)
     ner_hits = ner_extract(text)
-    return merge_results(regex_hits, gazette_hits, ner_hits)
+    llm_hits = llm_extract(text)
+    return regex_hits + ner_hits + llm_hits
 
-# ---------------- Streamlit UI ----------------
-st.title("🔎 PII Extractor (Regex + Gazetteer + NER + Rules)")
-st.write("Extracts Aadhaar, PAN, Phone, Email, FIR, Dates, Addresses, Names, Orgs, etc.")
-
-user_input = st.text_area("Paste FIR / Legal Text Here", height=200)
+# --- Streamlit UI ---
+st.title("🔎 Advanced PII Extractor (Regex + IndicNER + LLM)")
+txt = st.text_area("Paste FIR / Legal text", height=200)
 
 if st.button("Extract PII"):
-    if not user_input.strip():
-        st.warning("⚠️ Please paste some text first.")
+    if not txt.strip():
+        st.warning("Paste some text first!")
     else:
-        results = extract_pii(user_input)
+        results = extract_pii(txt)
         if results:
-            st.success(f"✅ Found {len(results)} PII entities")
             for r in results:
                 st.json(r)
         else:
-            st.error("❌ No PII found in the text.")
+            st.error("No PII found.")
