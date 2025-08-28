@@ -2,114 +2,117 @@
 import streamlit as st
 from transformers import pipeline
 import re
+import json
 
 # -------------------------
-# Load HuggingFace NER Model
+# Load HuggingFace Multilingual Model
 # -------------------------
 @st.cache_resource
 def load_model():
     return pipeline(
         "token-classification",
-        model="dslim/bert-base-NER",
+        model="Davlan/xlm-roberta-base-ner-hrl",  # multilingual NER
         aggregation_strategy="simple"
     )
 
 ner_pipeline = load_model()
 
 # -------------------------
-# Regex-based Extractor
+# Regex Extractor for Legal PII
 # -------------------------
 def regex_extract(text: str):
     pii = []
 
     # FIR No
-    fir = re.findall(r"FIR\s*No.*?(\d+)", text, flags=re.IGNORECASE)
-    for f in fir:
+    for f in re.findall(r"FIR\s*No.*?(\d+)", text, flags=re.IGNORECASE):
         pii.append({"label": "FIR_NO", "text": f})
 
-    # Dates (dd/mm/yyyy)
-    dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", text)
-    for d in dates:
+    # Dates
+    for d in re.findall(r"\d{1,2}/\d{1,2}/\d{4}", text):
         pii.append({"label": "DATE", "text": d})
 
-    # Times (hh:mm)
-    times = re.findall(r"\d{1,2}:\d{2}", text)
-    for t in times:
+    # Times
+    for t in re.findall(r"\d{1,2}:\d{2}", text):
         pii.append({"label": "TIME", "text": t})
 
     # Year
-    year = re.findall(r"Year.*?(\d{4})", text, flags=re.IGNORECASE)
-    for y in year:
+    for y in re.findall(r"\b(19|20)\d{2}\b", text):
         pii.append({"label": "YEAR", "text": y})
 
-    # Sections of IPC/Acts
-    sections = re.findall(r"Section[s]?\s*\d+[A-Za-z\-]*", text, flags=re.IGNORECASE)
-    for s in sections:
+    # Sections of Law
+    for s in re.findall(r"(?:Section|Sec)\s*\d+[A-Za-z\-]*", text, flags=re.IGNORECASE):
         pii.append({"label": "SECTION", "text": s})
 
-    # Address (roughly after keyword 'Address' or 'P.S.')
-    addresses = re.findall(r"(Address.*?[,.\n].*?)(?:\n|$)", text, flags=re.IGNORECASE)
-    for a in addresses:
+    # GD / Diary No
+    for g in re.findall(r"Diary\s*Reference.*?(\d+)", text, flags=re.IGNORECASE):
+        pii.append({"label": "GD_REFERENCE", "text": g})
+
+    # Address
+    for a in re.findall(r"Address[:\- ]+([^\n]+)", text, flags=re.IGNORECASE):
         pii.append({"label": "ADDRESS", "text": a.strip()})
+
+    # Police Station
+    for ps in re.findall(r"P\.?S\.?\s*[:\- ]+([^\n]+)", text, flags=re.IGNORECASE):
+        pii.append({"label": "POLICE_STATION", "text": ps.strip()})
 
     return pii
 
 # -------------------------
-# Streamlit App UI
+# Streamlit App
 # -------------------------
-st.set_page_config(page_title="PII Extractor", layout="wide")
-st.title("🔍 Multilingual PII Extractor (Legal Texts)")
+st.set_page_config(page_title="Multilingual PII Extractor", layout="wide")
+st.title("🔍 Multilingual Legal PII Extractor")
 
-sample_text = """1.\nP.S. (Police Thane): Bhosari \nFIR No.: 0523 \nDate and Time of FIR: \n19/11/2017 at 21:33 \nDistrict: Pune City \nYear: 2017
-Acts \nSections \n1 \n Section 25 \n3 \n Section 135
-Occurrence of offence: \nDate: 19/11/2017 \nTime: 21:09 hours
+sample_text = """P.S. (Police Thane): Bhosari
+FIR No.: 0523
+Date and Time of FIR: 19/11/2017 at 21:33
+District: Pune City
+Year: 2017
+Acts / Sections: Section 25, Section 135
 General Diary Reference: 029
 Date To: 19/11/2017
 Time From: 17:15 hours
-Address: Shoa Hate Íya Sadma, Moya Mat, Ashita, Asaravadi, Pune"""
+Address: Shoa Hate Sadma, Moya Mat, Ashita, Asaravadi, Pune"""
 
-with st.container():
-    st.subheader("Enter / Paste Legal Text")
-    user_text = st.text_area("Text Input", value=sample_text, height=300)
+user_text = st.text_area("Paste Legal FIR / Case Text", value=sample_text, height=300)
 
 if st.button("Extract PII"):
-    if user_text.strip() == "":
+    if not user_text.strip():
         st.warning("⚠️ Please enter some text first.")
     else:
-        # Run HuggingFace NER
+        # Run multilingual NER
         ner_results = ner_pipeline(user_text)
 
-        # Convert to simpler dict
         ner_extracted = []
         for r in ner_results:
             ner_extracted.append({
                 "label": r["entity_group"],
                 "text": r["word"],
-                "score": round(r["score"], 3)
+                "score": float(r["score"])  # ensure JSON-safe
             })
 
-        # Run Regex Extractor
+        # Regex PII
         regex_results = regex_extract(user_text)
 
-        # Merge both results
+        # Merge
         final_pii = ner_extracted + regex_results
 
-        # Display results
+        # Display
         st.subheader("📌 Extracted PII")
         if final_pii:
             for item in final_pii:
                 if "score" in item:
-                    st.write(f"**{item['label']}** → {item['text']} (score: {item['score']})")
+                    st.write(f"**{item['label']}** → {item['text']} (score={item['score']:.2f})")
                 else:
                     st.write(f"**{item['label']}** → {item['text']}")
         else:
             st.info("No PII detected.")
 
-        # Download as JSON
-        import json
+        # JSON-safe export
+        safe_json = json.dumps(final_pii, indent=2, ensure_ascii=False)
         st.download_button(
-            label="📥 Download PII (JSON)",
-            data=json.dumps(final_pii, indent=2, ensure_ascii=False),
+            "📥 Download JSON",
+            data=safe_json,
             file_name="pii_extracted.json",
             mime="application/json"
         )
