@@ -1,2 +1,8 @@
 streamlit 
 pandas
+elasticsearch 
+spacy
+transformers
+phonenumbers 
+email-validator
+torch
