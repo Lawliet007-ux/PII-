@@ -1,52 +1,75 @@
-# tool.py
+# pii_extractor.py
+import re
 import streamlit as st
-import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
 # ------------------- Setup -------------------
 st.set_page_config(page_title="PII Extractor", layout="wide")
 
-MODEL_NAME = "dslim/bert-base-NER"   # replace with your fine-tuned model if available
+MODEL_NAME = "dslim/bert-base-NER"   # Swap with fine-tuned model if available
 
 @st.cache_resource
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME)
     nlp = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
-    return nlp, tokenizer
+    return nlp
 
-nlp, tokenizer = load_model()
+nlp = load_model()
 
-# ------------------- Helpers -------------------
-def chunk_text(text, max_length=512, stride=256):
-    """Split long text into overlapping chunks within model's limit"""
-    tokens = tokenizer(
-        text,
-        return_overflowing_tokens=True,
-        max_length=max_length,
-        stride=stride,
-        truncation=True
-    )
-    chunks = tokens["input_ids"]
-    chunk_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in chunks]
-    return chunk_texts
+# ------------------- Regex Rules -------------------
+regex_patterns = {
+    "phone": r"\b[6-9]\d{9}\b",
+    "fir_no": r"\bFIR\s*No[:\-]?\s*\w+",
+    "date": r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",
+    "time": r"\b\d{1,2}:\d{2}\b",
+    "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+    "pincode": r"\b\d{6}\b"
+}
 
-def extract_pii(text):
-    """Extract PII from long text using chunking"""
+def regex_extract(text):
+    """Extract PII using regex rules"""
     results = []
-    chunks = chunk_text(text)
-    for chunk in chunks:
-        entities = nlp(chunk)
-        for ent in entities:
+    for label, pattern in regex_patterns.items():
+        matches = re.findall(pattern, text)
+        for m in matches:
             results.append({
-                "label": ent["entity_group"],
-                "text": ent["word"],
-                "confidence": round(ent["score"], 3)
+                "label": label,
+                "text": m,
+                "confidence": 1.0  # regex = high confidence
             })
     return results
 
+# ------------------- NER Extract -------------------
+def ner_extract(text):
+    """Extract PII using NER model with filtering"""
+    ents = nlp(text)
+    results = []
+    for e in ents:
+        word = e["word"].strip()
+        # Filter out junk: single chars, weird subtokens
+        if len(word) < 2: 
+            continue
+        results.append({
+            "label": e["entity_group"],
+            "text": word,
+            "confidence": round(float(e["score"]), 3)
+        })
+    return results
+
+# ------------------- Merge + Deduplicate -------------------
+def merge_results(regex_res, ner_res):
+    seen = set()
+    final = []
+    for r in regex_res + ner_res:
+        key = (r["label"], r["text"].lower())
+        if key not in seen:
+            seen.add(key)
+            final.append(r)
+    return final
+
 # ------------------- UI -------------------
-st.title("🔍 PII Extractor for FIR / Legal Docs")
+st.title("🔍 Robust PII Extractor for FIR / Legal Docs")
 
 sample_text = """FIR No: 0523, Date: 19/11/2017, Time: 21:33,
 Police Station: Bhosari, District: Pune,
@@ -56,7 +79,9 @@ text_input = st.text_area("Paste FIR / Document text here:", sample_text, height
 
 if st.button("Extract PII"):
     with st.spinner("Extracting PII..."):
-        results = extract_pii(text_input)
+        regex_res = regex_extract(text_input)
+        ner_res = ner_extract(text_input)
+        results = merge_results(regex_res, ner_res)
 
     if results:
         st.subheader("📑 Extracted PII")
