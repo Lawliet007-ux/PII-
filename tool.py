@@ -1,110 +1,129 @@
-import json
-st.title("🔎 Multilingual PII Extractor for Legal OCR (EN + Indic)")
-st.caption("Hybrid rules + Indic NER. Designed to minimize false positives and misses.")
+"""
+Streamlit Multilingual PII Extractor for Legal OCR Text (EN + Indic languages)
+-----------------------------------------------------------------------------
+"""
 
+import json
+import re
+from typing import Dict, List, Tuple, Any
+
+import streamlit as st
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+
+# ----------------------------
+# Normalization
+# ----------------------------
+
+DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+def normalize_ocr(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    t = t.translate(DEVANAGARI_DIGITS)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+# ----------------------------
+# Regex Rules
+# ----------------------------
+
+RE_EMAIL = re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b")
+RE_PHONE = re.compile(r"(?<!\d)(?:\+?91[- ]?)?(?:[6-9]\d{9})(?!\d)")
+RE_DATE = re.compile(r"\b(?:(?:[0-3]?\d)[/-](?:0?\d|1[0-2])[/-](?:\d{2,4})|\d{4}-\d{2}-\d{2})\b")
+
+RULES = [
+    ("EMAIL", RE_EMAIL),
+    ("PHONE", RE_PHONE),
+    ("DATE", RE_DATE)
+]
+
+# ----------------------------
+# Load NER
+# ----------------------------
+
+@st.cache_resource(show_spinner=False)
+def load_ner_pipeline(model_name: str = "ai4bharat/IndicNER"):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForTokenClassification.from_pretrained(model_name)
+    nlp = pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+    return nlp
+
+LABEL_MAP = {
+    "PER": "PERSON",
+    "PERSON": "PERSON",
+    "ORG": "ORG",
+    "LOC": "LOCATION",
+    "GPE": "LOCATION",
+    "ADDRESS": "ADDRESS",
+}
+
+# ----------------------------
+# Extraction
+# ----------------------------
+
+def run_regex_rules(text: str):
+    spans = []
+    for label, pat in RULES:
+        for m in pat.finditer(text):
+            spans.append({"label": label, "text": m.group(0)})
+    return spans
+
+def run_ner(text: str, nlp, min_score: float):
+    spans = []
+    outputs = nlp(text)
+    for ent in outputs:
+        label = LABEL_MAP.get(ent.get("entity_group"), None)
+        if not label:
+            continue
+        score = float(ent.get("score", 0.0))
+        if score < min_score:
+            continue
+        spans.append({"label": label, "text": text[ent["start"]:ent["end"]], "score": round(score, 3)})
+    return spans
+
+# ----------------------------
+# Streamlit App
+# ----------------------------
+
+st.set_page_config(page_title="Multilingual PII Extractor (Legal OCR)", layout="wide")
+st.title("🔎 Multilingual PII Extractor for Legal OCR (EN + Indic)")
 
 with st.sidebar:
     st.header("Model & Settings")
-    model_name = st.text_input(
-        "HF model",
-        value="ai4bharat/IndicNER",
-        help="Change to your fine-tuned model if available."
-    )
-    threshold = st.slider(
-        "NER confidence threshold",
-        0.0,
-        1.0,
-        0.55,
-        0.01,
-        help="Higher = fewer false positives, but may miss low-confidence entities in noisy OCR."
-    )
+    model_name = st.text_input("HF model", value="ai4bharat/IndicNER")
+    threshold = st.slider("NER confidence threshold", 0.0, 1.0, 0.55, 0.01)
     apply_regex = st.checkbox("Apply regex rules", value=True)
     apply_ner = st.checkbox("Apply NER model", value=True)
     mask_token = st.text_input("Mask token for redaction", value="▮▮▮")
 
-    st.markdown("---")
-    st.write("**Tips**: For very noisy OCR, lower threshold to ~0.45 and rely more on regex for dates/IDs.")
-
-nlp = load_ner_pipeline(model_name) if st.session_state.get("loaded_model") != model_name else st.session_state.get("nlp")
-st.session_state["loaded_model"] = model_name
-st.session_state["nlp"] = nlp
-
+nlp = load_ner_pipeline(model_name)
 
 sample_text = (
-"1.\nP.S. (Police Thane): Bhosari \nFIR No. (C.R.): 0523 \nDate and Time of FIR: \n19/11/2017 at 21:33 \nDistrict: Pune City \nYear: 2017\n"
-"2.\nS.No. \nActs \nSections \n1 \n \n25 \n 3\n3 \n Maharashtra Police \n135\n (a) \nOccurrence of offence: \n (b) \nInformation received at P.S.: \nDate: 19/11/2017 \nTime: 21:09 hours \n (c) \nGeneral Diary Reference: \n029\nDay: Sunday \nDate from: 19/11/2017 \nDate To: 19/11/2017\nTime Period: \nTime From: 17:15 hours \n (a) Direction and distance from P.S.: N, 2 Min. \n (b) Address: Shoba Hate Sadma, Maya Mata, Ashit, Asarawadi, Pune\n"
+    "P.S. (Police Thane): Bhosari \nFIR No.: 0523 \nDate and Time of FIR: 19/11/2017 at 21:33 \nDistrict: Pune City"
 )
 
-
-text = st.text_area(
-"Paste Elasticsearch text here (any language/mixed)",
-value=sample_text,
-height=260,
-)
-
+text = st.text_area("Paste text here", value=sample_text, height=200)
 
 col_run, col_clear = st.columns([1, 1])
 with col_run:
-run = st.button("Extract PII", type="primary")
+    run = st.button("Extract PII", type="primary")
 with col_clear:
-if st.button("Clear"):
-st.experimental_rerun()
-
+    clear = st.button("Clear")
 
 if run:
-raw = text
-norm = normalize_ocr(raw)
+    norm = normalize_ocr(text)
+    spans = []
+    if apply_regex:
+        spans.extend(run_regex_rules(norm))
+    if apply_ner:
+        spans.extend(run_ner(norm, nlp, threshold))
 
+    st.subheader("Results")
+    st.json(spans)
 
-spans: List[Span] = []
-if apply_regex:
-spans.extend(run_regex_rules(norm))
-if apply_ner and nlp is not None:
-spans.extend(run_ner(norm, nlp, threshold))
-
-
-spans = filter_false_positives(spans)
-spans = dedupe_spans(spans)
-
-
-grouped = group_by_label(spans)
-
-
-st.subheader("Results")
-c1, c2 = st.columns(2)
-with c1:
-st.markdown("**Normalized Input**")
-st.code(norm, language="text")
-st.markdown("**Redaction Preview**")
-st.code(redact_text(norm, spans, mask_token=mask_token), language="text")
-
-
-with c2:
-st.markdown("**Extracted PII (JSON)**")
-st.json(grouped)
-
-
-# Download JSON
-st.download_button(
-label="Download PII JSON",
-data=json.dumps(grouped, ensure_ascii=False, indent=2),
-file_name="pii_extracted.json",
-mime="application/json",
-)
-
-
-# Simple metrics
-st.markdown("---")
-st.write(f"**Total entities:** {len(spans)}")
-label_counts = {k: len(v) for k, v in grouped.items()}
-if label_counts:
-st.write("**Counts by type:**", label_counts)
-
+elif clear:
+    st.experimental_rerun()
 
 st.markdown("---")
-st.markdown(
-"**Notes**: \n"
-"- Swap in your fine-tuned HF NER for best accuracy on FIRs. \n"
-"- Extend regexes for other IDs (e.g., VoterID, DL, Passport) as needed. \n"
-"- To avoid over-redaction, keep the threshold moderate and use the blacklist in `filter_false_positives()`.\n"
-)
+st.caption("This tool extracts PII from multilingual OCR text using regex + NER.")
