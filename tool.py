@@ -1,23 +1,23 @@
-# app_stanza.py
+# app_transformer.py
 import streamlit as st
 import re, json
 import pandas as pd
-from dateutil import parser as dateparser
+from transformers import pipeline
+from typing import List, Dict
 
-# --- NLP (Stanza) ---
-import stanza
-
+# ---------------------------
+# Load HuggingFace NER model
+# ---------------------------
 @st.cache_resource
-def load_stanza_pipelines():
-    # Download once: stanza.download("en"); stanza.download("hi")
-    return {
-        "en": stanza.Pipeline("en", processors="tokenize,ner", use_gpu=False),
-        "hi": stanza.Pipeline("hi", processors="tokenize,ner", use_gpu=False)
-    }
+def load_model():
+    # ai4bharat/IndicNER supports Hindi + English
+    return pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
 
-nlp_pipes = load_stanza_pipelines()
+ner_model = load_model()
 
-# --- Regex patterns ---
+# ---------------------------
+# Regex patterns for structured PII
+# ---------------------------
 REGEX_PATTERNS = {
     "aadhaar": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
     "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -26,33 +26,39 @@ REGEX_PATTERNS = {
     "fir_no": r"FIR\s*(?:No\.?|Number)?[:\s]*[\w\d/-]+",
     "date": r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b",
     "time": r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b",
+    "pin": r"\b\d{6}\b"
 }
 
-def regex_extract(text):
+def regex_extract(text: str) -> List[Dict]:
     out = []
     for label, pat in REGEX_PATTERNS.items():
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
             out.append({"label": label, "text": m.group(), "confidence": 0.95})
     return out
 
-def stanza_extract(text, lang="en"):
-    out = []
-    if lang not in nlp_pipes:
-        return out
-    doc = nlp_pipes[lang](text)
-    for ent in doc.ents:
-        out.append({"label": ent.type, "text": ent.text, "confidence": 0.9})
-    return out
-
-# --- Main extractor ---
-def extract_pii(text: str):
+# ---------------------------
+# NER Extract (Transformer)
+# ---------------------------
+def ner_extract(text: str) -> List[Dict]:
     results = []
-    # regex (lang agnostic)
-    results.extend(regex_extract(text))
-    # run both Hindi + English NER (since mix is possible)
-    results.extend(stanza_extract(text, "hi"))
-    results.extend(stanza_extract(text, "en"))
-    # deduplicate
+    # Split into chunks (model max length ~512 tokens)
+    words = text.split()
+    chunk_size = 200
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i+chunk_size])
+        ents = ner_model(chunk)
+        for e in ents:
+            results.append({
+                "label": e["entity_group"],
+                "text": e["word"],
+                "confidence": float(e["score"])
+            })
+    return results
+
+# ---------------------------
+# Merge + dedup
+# ---------------------------
+def merge_results(results: List[Dict]) -> List[Dict]:
     seen = set()
     final = []
     for r in results:
@@ -62,9 +68,21 @@ def extract_pii(text: str):
             final.append(r)
     return final
 
-# --- Streamlit UI ---
-st.title("PII Extractor (Regex + Stanza NER)")
-txt = st.text_area("Paste OCR/ES legal text here:", height=250)
+# ---------------------------
+# Full extractor
+# ---------------------------
+def extract_pii(text: str) -> List[Dict]:
+    regex_hits = regex_extract(text)
+    ner_hits = ner_extract(text)
+    merged = merge_results(regex_hits + ner_hits)
+    return merged
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.title("⚖️ PII Extractor (Regex + Transformer NER)")
+
+txt = st.text_area("Paste OCR/Elasticsearch FIR/legal text here:", height=300)
 
 if st.button("Extract PII"):
     if not txt.strip():
@@ -74,7 +92,9 @@ if st.button("Extract PII"):
         if ents:
             df = pd.DataFrame(ents)
             st.dataframe(df)
-            st.download_button("Download JSON", data=json.dumps(ents, ensure_ascii=False, indent=2),
-                               file_name="pii.json", mime="application/json")
+            st.download_button("Download JSON",
+                               data=json.dumps(ents, ensure_ascii=False, indent=2),
+                               file_name="pii.json",
+                               mime="application/json")
         else:
             st.warning("No PII detected.")
