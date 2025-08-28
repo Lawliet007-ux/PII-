@@ -1,23 +1,16 @@
-# app_transformer.py
-import streamlit as st
 import re, json
 import pandas as pd
 from transformers import pipeline
-from typing import List, Dict
+from rapidfuzz import fuzz
 
-# ---------------------------
-# Load HuggingFace NER model
-# ---------------------------
-@st.cache_resource
-def load_model():
-    # ai4bharat/IndicNER supports Hindi + English
-    return pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
+# ---------------------
+# Load NER Model
+# ---------------------
+ner_model = pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
 
-ner_model = load_model()
-
-# ---------------------------
-# Regex patterns for structured PII
-# ---------------------------
+# ---------------------
+# Regex Patterns
+# ---------------------
 REGEX_PATTERNS = {
     "aadhaar": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
     "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -29,19 +22,24 @@ REGEX_PATTERNS = {
     "pin": r"\b\d{6}\b"
 }
 
-def regex_extract(text: str) -> List[Dict]:
+# ---------------------
+# Gazetteer (expandable)
+# ---------------------
+DISTRICTS = ["Pune City", "Nagpur", "Mumbai", "Delhi", "Lucknow"]  # demo
+POLICE_TERMS = ["Police Station", "P.S.", "Thane", "Thana"]
+
+# ---------------------
+# Extractors
+# ---------------------
+def regex_extract(text):
     out = []
     for label, pat in REGEX_PATTERNS.items():
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
             out.append({"label": label, "text": m.group(), "confidence": 0.95})
     return out
 
-# ---------------------------
-# NER Extract (Transformer)
-# ---------------------------
-def ner_extract(text: str) -> List[Dict]:
+def ner_extract(text):
     results = []
-    # Split into chunks (model max length ~512 tokens)
     words = text.split()
     chunk_size = 200
     for i in range(0, len(words), chunk_size):
@@ -55,46 +53,44 @@ def ner_extract(text: str) -> List[Dict]:
             })
     return results
 
-# ---------------------------
-# Merge + dedup
-# ---------------------------
-def merge_results(results: List[Dict]) -> List[Dict]:
-    seen = set()
-    final = []
+def rule_extract(text):
+    out = []
+    # Police Station
+    ps_match = re.findall(r"(?:P\.S\.|Police Thane|Police Station)[:\-]?\s*([A-Za-z\u0900-\u097F ]+)", text)
+    for ps in ps_match:
+        out.append({"label": "POLICE_STATION", "text": ps.strip(), "confidence": 0.9})
+    # District
+    dist_match = re.findall(r"District[:\-]?\s*([A-Za-z\u0900-\u097F ]+)", text)
+    for d in dist_match:
+        out.append({"label": "DISTRICT", "text": d.strip(), "confidence": 0.9})
+    return out
+
+def gazetteer_match(text):
+    out = []
+    for d in DISTRICTS:
+        if d.lower() in text.lower():
+            out.append({"label": "DISTRICT", "text": d, "confidence": 0.85})
+    return out
+
+# ---------------------
+# Merge + Deduplicate
+# ---------------------
+def merge_results(results):
+    final, seen = [], set()
     for r in results:
-        key = (r["label"].lower(), r["text"].lower())
-        if key not in seen:
-            seen.add(key)
+        key = r["text"].lower()
+        if not any(fuzz.ratio(key, f["text"].lower()) > 90 and r["label"] == f["label"] for f in final):
             final.append(r)
     return final
 
-# ---------------------------
-# Full extractor
-# ---------------------------
-def extract_pii(text: str) -> List[Dict]:
+# ---------------------
+# Main
+# ---------------------
+def extract_pii(text: str):
     regex_hits = regex_extract(text)
     ner_hits = ner_extract(text)
-    merged = merge_results(regex_hits + ner_hits)
-    return merged
+    rule_hits = rule_extract(text)
+    gaz_hits = gazetteer_match(text)
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("⚖️ PII Extractor (Regex + Transformer NER)")
-
-txt = st.text_area("Paste OCR/Elasticsearch FIR/legal text here:", height=300)
-
-if st.button("Extract PII"):
-    if not txt.strip():
-        st.error("Please enter text")
-    else:
-        ents = extract_pii(txt)
-        if ents:
-            df = pd.DataFrame(ents)
-            st.dataframe(df)
-            st.download_button("Download JSON",
-                               data=json.dumps(ents, ensure_ascii=False, indent=2),
-                               file_name="pii.json",
-                               mime="application/json")
-        else:
-            st.warning("No PII detected.")
+    all_hits = regex_hits + ner_hits + rule_hits + gaz_hits
+    return merge_results(all_hits)
