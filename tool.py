@@ -5,7 +5,7 @@ from transformers import pipeline
 
 st.set_page_config(page_title="Advanced PII Extractor", layout="wide")
 
-# Regex patterns (same as before, extended)
+# ------------------- Regex Patterns -------------------
 REGEX_PATTERNS = {
     "aadhaar": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
     "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -20,14 +20,6 @@ REGEX_PATTERNS = {
     "pin": r"\b\d{6}\b"
 }
 
-# IndicNER model (better than XLM-R for Indian PII)
-@st.cache_resource
-def load_ner():
-    return pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
-
-ner_model = load_ner()
-
-# --- Regex extractor ---
 def regex_extract(text):
     out = []
     for label, pat in REGEX_PATTERNS.items():
@@ -35,50 +27,37 @@ def regex_extract(text):
             out.append({"label": label, "text": m.group().strip(), "confidence": 0.99})
     return out
 
-# --- NER extractor ---
-def ner_extract(text):
-    ents = ner_model(text)
-    out = []
-    for ent in ents:
-        if ent["entity_group"] in ["PER", "LOC", "ORG"]:
-            out.append({
-                "label": ent["entity_group"].lower(),
-                "text": ent["word"],
-                "confidence": float(ent["score"])
-            })
-    return out
+# ------------------- NER Model -------------------
+@st.cache_resource
+def load_ner():
+    # Using a smaller multilingual model (lightweight)
+    return pipeline("ner", model="Davlan/xlm-roberta-base-ner-hrl", aggregation_strategy="simple")
 
-# --- LLM-based structured extraction ---
-from transformers import pipeline as hf_pipeline
-llm = hf_pipeline("text2text-generation", model="google/flan-t5-large")  # lightweight
-
-def llm_extract(text):
-    prompt = f"""
-    Extract all Personal Identifiable Information (PII) from the following text.
-    Return JSON with keys: Names, Addresses, IDs, Contacts, PoliceStations, Dates.
-    
-    Text: {text}
-    """
-    response = llm(prompt, max_new_tokens=512)[0]["generated_text"]
-    try:
-        data = json.loads(response)
-        out = []
-        for key, vals in data.items():
-            for v in vals:
-                out.append({"label": key.lower(), "text": v, "confidence": 0.95})
-        return out
-    except:
-        return []
-
-# --- Merge ---
+# ------------------- Extraction -------------------
 def extract_pii(text):
-    regex_hits = regex_extract(text)
-    ner_hits = ner_extract(text)
-    llm_hits = llm_extract(text)
-    return regex_hits + ner_hits + llm_hits
+    results = []
 
-# --- Streamlit UI ---
-st.title("🔎 Advanced PII Extractor (Regex + IndicNER + LLM)")
+    # Regex Pass
+    results.extend(regex_extract(text))
+
+    # NER Pass
+    try:
+        ner = load_ner()
+        ents = ner(text)
+        for ent in ents:
+            if ent["entity_group"] in ["PER", "LOC", "ORG"]:
+                results.append({
+                    "label": ent["entity_group"].lower(),
+                    "text": ent["word"],
+                    "confidence": float(ent["score"])
+                })
+    except Exception as e:
+        st.error(f"NER model failed: {e}")
+
+    return results
+
+# ------------------- Streamlit UI -------------------
+st.title("🔎 Advanced PII Extractor")
 txt = st.text_area("Paste FIR / Legal text", height=200)
 
 if st.button("Extract PII"):
