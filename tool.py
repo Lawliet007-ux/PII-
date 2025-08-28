@@ -4,18 +4,26 @@ st.caption("Hybrid rules + Indic NER. Designed to minimize false positives and m
 
 
 with st.sidebar:
-st.header("Model & Settings")
-model_name = st.text_input("HF model", value="ai4bharat/IndicNER", help="Change to your fine-tuned model if available.")
-threshold = st.slider("NER confidence threshold", 0.0, 1.0, 0.55, 0.01,
-help="Higher = fewer false positives, but may miss low-confidence entities in noisy OCR.")
-apply_regex = st.checkbox("Apply regex rules", value=True)
-apply_ner = st.checkbox("Apply NER model", value=True)
-mask_token = st.text_input("Mask token for redaction", value="▮▮▮")
+    st.header("Model & Settings")
+    model_name = st.text_input(
+        "HF model",
+        value="ai4bharat/IndicNER",
+        help="Change to your fine-tuned model if available."
+    )
+    threshold = st.slider(
+        "NER confidence threshold",
+        0.0,
+        1.0,
+        0.55,
+        0.01,
+        help="Higher = fewer false positives, but may miss low-confidence entities in noisy OCR."
+    )
+    apply_regex = st.checkbox("Apply regex rules", value=True)
+    apply_ner = st.checkbox("Apply NER model", value=True)
+    mask_token = st.text_input("Mask token for redaction", value="▮▮▮")
 
-
-st.markdown("---")
-st.write("**Tips**: For very noisy OCR, lower threshold to ~0.45 and rely more on regex for dates/IDs.")
-
+    st.markdown("---")
+    st.write("**Tips**: For very noisy OCR, lower threshold to ~0.45 and rely more on regex for dates/IDs.")
 
 nlp = load_ner_pipeline(model_name) if st.session_state.get("loaded_model") != model_name else st.session_state.get("nlp")
 st.session_state["loaded_model"] = model_name
