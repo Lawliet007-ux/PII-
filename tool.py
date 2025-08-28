@@ -1,104 +1,92 @@
-# better_pii_extractor.py
-import re
+# tool.py
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+import re
+import spacy
+from transformers import pipeline
 
-# ------------------- Setup -------------------
-st.set_page_config(page_title="Better PII Extractor", layout="wide")
-
-MODEL_NAME = "dslim/bert-base-NER"   # try "ai4bharat/IndicNER" for Indian context
-
+# ---------- Load Models ----------
 @st.cache_resource
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME)
-    nlp = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
-    return nlp
+def load_models():
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
+        nlp = spacy.load("en_core_web_sm")
 
-nlp = load_model()
+    pii_model = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+    return nlp, pii_model
 
-# ------------------- Regex Rules -------------------
+nlp, pii_model = load_models()
+
+# ---------- Regex Patterns ----------
 regex_patterns = {
-    "phone": r"\b[6-9]\d{9}\b",
-    "fir_no": r"\bFIR\s*No[:\-]?\s*[\w\/\-]+",
-    "date": r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",
-    "time": r"\b\d{1,2}[:\.]\d{2}\b",
-    "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-    "pincode": r"\b\d{6}\b",
-    "vehicle_no": r"\b[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,2}\s?\d{4}\b",
-    "aadhaar": r"\b\d{4}\s\d{4}\s\d{4}\b"
+    "phone": r"\b(?:\+91[-\s]?)?[6-9]\d{9}\b",
+    "date": r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+    "time": r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b",
+    "aadhaar": r"\b\d{4}\s\d{4}\s\d{4}\b",
+    "passport": r"\b[A-Z]{1}-?\d{7}\b",
 }
 
-def regex_extract(text):
+# ---------- Extract PII ----------
+def extract_pii(text):
     results = []
+
+    # Regex-based PII
     for label, pattern in regex_patterns.items():
-        for m in re.findall(pattern, text):
-            results.append({"label": label, "text": m.strip(), "confidence": 1.0})
-    return results
+        for match in re.finditer(pattern, text):
+            results.append({
+                "label": label,
+                "text": match.group(),
+                "confidence": 1.0
+            })
 
-# ------------------- NER Extract + Join -------------------
-def ner_extract(text):
-    ents = nlp(text)
-    merged = []
-    buffer = []
-    prev_label = None
+    # spaCy NER
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ["PERSON", "GPE", "ORG"]:
+            results.append({
+                "label": ent.label_.lower(),
+                "text": ent.text,
+                "confidence": 0.95
+            })
 
-    for e in ents:
-        word = e["word"].strip()
-        if e["score"] < 0.6 or len(word) < 2 or word.startswith("##"):
-            continue
+    # Transformer NER (chunking for long texts)
+    max_chunk = 400
+    words = text.split()
+    for i in range(0, len(words), max_chunk):
+        chunk = " ".join(words[i:i+max_chunk])
+        ner_results = pii_model(chunk)
+        for r in ner_results:
+            results.append({
+                "label": r["entity_group"].lower(),
+                "text": r["word"],
+                "confidence": float(r["score"])
+            })
 
-        label = e["entity_group"].lower()
-
-        if prev_label == label:   # same entity → join
-            buffer.append(word)
-        else:
-            if buffer:
-                merged.append({"label": prev_label, "text": " ".join(buffer), "confidence": round(float(e["score"]), 3)})
-            buffer = [word]
-            prev_label = label
-
-    if buffer:
-        merged.append({"label": prev_label, "text": " ".join(buffer), "confidence": 0.9})
-
-    return merged
-
-# ------------------- Post-Processing -------------------
-def clean_and_merge(results):
+    # Deduplicate
+    unique = []
     seen = set()
-    final = []
     for r in results:
-        txt = r["text"].strip()
-        txt = re.sub(r"[^\w\s\-/]", "", txt)
-        if len(txt) < 2:  # drop junk
-            continue
-        key = (r["label"], txt.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        final.append({"label": r["label"], "text": txt, "confidence": r["confidence"]})
-    return final
+        key = (r["label"], r["text"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
 
-# ------------------- UI -------------------
-st.title("🔍 Better PII Extractor (Legal / FIR Docs)")
+    return unique
 
-sample_text = """FIR No: 0523, Date: 19/11/2017, Time: 21:33,
-Police Station: Bhosari, District: Pune,
-Phone: 7720010466, Name: Anand Jes,
-Complainant: Rev. Dinanath, Accused: Sanjay Kumar,
-Location: Pune City, Maharashtra, India"""
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="PII Extractor", layout="wide")
+st.title("📑 PII Extraction from FIR / Legal Text")
 
-text_input = st.text_area("Paste FIR / Document text here:", sample_text, height=300)
+input_text = st.text_area("Paste the FIR/legal case text below:", height=300)
 
 if st.button("Extract PII"):
-    with st.spinner("Extracting PII..."):
-        regex_res = regex_extract(text_input)
-        ner_res = ner_extract(text_input)
-        merged = clean_and_merge(regex_res + ner_res)
-
-    if merged:
+    if input_text.strip():
+        with st.spinner("Extracting..."):
+            pii_data = extract_pii(input_text)
         st.subheader("📑 Extracted PII")
-        for r in merged:
-            st.json(r)
+        for item in pii_data:
+            st.json(item)
     else:
-        st.warning("No PII found in the text!")
+        st.warning("Please enter some text.")
