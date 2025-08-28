@@ -1,16 +1,20 @@
-import re, json
+# tool.py
+import streamlit as st
 import pandas as pd
+import re
 from transformers import pipeline
 from rapidfuzz import fuzz
 
-# ---------------------
-# Load NER Model
-# ---------------------
-ner_model = pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
+st.set_page_config(page_title="PII Extractor", layout="wide")
 
-# ---------------------
-# Regex Patterns
-# ---------------------
+# ------------------- Load NER Model -------------------
+@st.cache_resource
+def load_model():
+    return pipeline("ner", model="ai4bharat/IndicNER", aggregation_strategy="simple")
+
+ner_model = load_model()
+
+# ------------------- Regex Patterns -------------------
 REGEX_PATTERNS = {
     "aadhaar": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
     "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -22,15 +26,7 @@ REGEX_PATTERNS = {
     "pin": r"\b\d{6}\b"
 }
 
-# ---------------------
-# Gazetteer (expandable)
-# ---------------------
-DISTRICTS = ["Pune City", "Nagpur", "Mumbai", "Delhi", "Lucknow"]  # demo
-POLICE_TERMS = ["Police Station", "P.S.", "Thane", "Thana"]
-
-# ---------------------
-# Extractors
-# ---------------------
+# ------------------- Helpers -------------------
 def regex_extract(text):
     out = []
     for label, pat in REGEX_PATTERNS.items():
@@ -53,44 +49,43 @@ def ner_extract(text):
             })
     return results
 
-def rule_extract(text):
-    out = []
-    # Police Station
-    ps_match = re.findall(r"(?:P\.S\.|Police Thane|Police Station)[:\-]?\s*([A-Za-z\u0900-\u097F ]+)", text)
-    for ps in ps_match:
-        out.append({"label": "POLICE_STATION", "text": ps.strip(), "confidence": 0.9})
-    # District
-    dist_match = re.findall(r"District[:\-]?\s*([A-Za-z\u0900-\u097F ]+)", text)
-    for d in dist_match:
-        out.append({"label": "DISTRICT", "text": d.strip(), "confidence": 0.9})
-    return out
-
-def gazetteer_match(text):
-    out = []
-    for d in DISTRICTS:
-        if d.lower() in text.lower():
-            out.append({"label": "DISTRICT", "text": d, "confidence": 0.85})
-    return out
-
-# ---------------------
-# Merge + Deduplicate
-# ---------------------
 def merge_results(results):
-    final, seen = [], set()
+    final = []
     for r in results:
-        key = r["text"].lower()
-        if not any(fuzz.ratio(key, f["text"].lower()) > 90 and r["label"] == f["label"] for f in final):
+        if not any(fuzz.ratio(r["text"].lower(), f["text"].lower()) > 90 and r["label"] == f["label"] for f in final):
             final.append(r)
     return final
 
-# ---------------------
-# Main
-# ---------------------
 def extract_pii(text: str):
     regex_hits = regex_extract(text)
     ner_hits = ner_extract(text)
-    rule_hits = rule_extract(text)
-    gaz_hits = gazetteer_match(text)
+    return merge_results(regex_hits + ner_hits)
 
-    all_hits = regex_hits + ner_hits + rule_hits + gaz_hits
-    return merge_results(all_hits)
+# ------------------- Streamlit UI -------------------
+st.title("🔍 Multilingual PII Extractor (Legal FIR Data)")
+
+opt = st.radio("Choose Input:", ["Paste Text", "Upload CSV"])
+
+if opt == "Paste Text":
+    user_text = st.text_area("Paste FIR / Legal text:", height=200)
+    if st.button("Extract PII"):
+        if user_text.strip():
+            with st.spinner("Extracting..."):
+                results = extract_pii(user_text)
+            st.json(results)
+        else:
+            st.warning("Please enter some text.")
+
+else:
+    file = st.file_uploader("Upload CSV", type=["csv"])
+    if file:
+        df = pd.read_csv(file)
+        st.write("📄 Data Preview:", df.head())
+
+        col = st.selectbox("Select column containing text:", df.columns)
+        if st.button("Extract PII from CSV"):
+            with st.spinner("Processing all rows... this may take time."):
+                df["PII"] = df[col].astype(str).apply(lambda x: extract_pii(x))
+            st.success("Done ✅")
+            st.dataframe(df[["PII"]].head())
+            st.download_button("Download Results", df.to_csv(index=False).encode("utf-8"), "pii_extracted.csv", "text/csv")
