@@ -1,129 +1,115 @@
-"""
-Streamlit Multilingual PII Extractor for Legal OCR Text (EN + Indic languages)
------------------------------------------------------------------------------
-"""
-
-import json
-import re
-from typing import Dict, List, Tuple, Any
-
+# tool.py
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from transformers import pipeline
+import re
 
-# ----------------------------
-# Normalization
-# ----------------------------
+# -------------------------
+# Load HuggingFace NER Model
+# -------------------------
+@st.cache_resource
+def load_model():
+    return pipeline(
+        "token-classification",
+        model="dslim/bert-base-NER",
+        aggregation_strategy="simple"
+    )
 
-DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+ner_pipeline = load_model()
 
-def normalize_ocr(text: str) -> str:
-    if not text:
-        return ""
-    t = text
-    t = t.translate(DEVANAGARI_DIGITS)
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
+# -------------------------
+# Regex-based Extractor
+# -------------------------
+def regex_extract(text: str):
+    pii = []
 
-# ----------------------------
-# Regex Rules
-# ----------------------------
+    # FIR No
+    fir = re.findall(r"FIR\s*No.*?(\d+)", text, flags=re.IGNORECASE)
+    for f in fir:
+        pii.append({"label": "FIR_NO", "text": f})
 
-RE_EMAIL = re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b")
-RE_PHONE = re.compile(r"(?<!\d)(?:\+?91[- ]?)?(?:[6-9]\d{9})(?!\d)")
-RE_DATE = re.compile(r"\b(?:(?:[0-3]?\d)[/-](?:0?\d|1[0-2])[/-](?:\d{2,4})|\d{4}-\d{2}-\d{2})\b")
+    # Dates (dd/mm/yyyy)
+    dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", text)
+    for d in dates:
+        pii.append({"label": "DATE", "text": d})
 
-RULES = [
-    ("EMAIL", RE_EMAIL),
-    ("PHONE", RE_PHONE),
-    ("DATE", RE_DATE)
-]
+    # Times (hh:mm)
+    times = re.findall(r"\d{1,2}:\d{2}", text)
+    for t in times:
+        pii.append({"label": "TIME", "text": t})
 
-# ----------------------------
-# Load NER
-# ----------------------------
+    # Year
+    year = re.findall(r"Year.*?(\d{4})", text, flags=re.IGNORECASE)
+    for y in year:
+        pii.append({"label": "YEAR", "text": y})
 
-@st.cache_resource(show_spinner=False)
-def load_ner_pipeline(model_name: str = "ai4bharat/IndicNER"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForTokenClassification.from_pretrained(model_name)
-    nlp = pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
-    return nlp
+    # Sections of IPC/Acts
+    sections = re.findall(r"Section[s]?\s*\d+[A-Za-z\-]*", text, flags=re.IGNORECASE)
+    for s in sections:
+        pii.append({"label": "SECTION", "text": s})
 
-LABEL_MAP = {
-    "PER": "PERSON",
-    "PERSON": "PERSON",
-    "ORG": "ORG",
-    "LOC": "LOCATION",
-    "GPE": "LOCATION",
-    "ADDRESS": "ADDRESS",
-}
+    # Address (roughly after keyword 'Address' or 'P.S.')
+    addresses = re.findall(r"(Address.*?[,.\n].*?)(?:\n|$)", text, flags=re.IGNORECASE)
+    for a in addresses:
+        pii.append({"label": "ADDRESS", "text": a.strip()})
 
-# ----------------------------
-# Extraction
-# ----------------------------
+    return pii
 
-def run_regex_rules(text: str):
-    spans = []
-    for label, pat in RULES:
-        for m in pat.finditer(text):
-            spans.append({"label": label, "text": m.group(0)})
-    return spans
+# -------------------------
+# Streamlit App UI
+# -------------------------
+st.set_page_config(page_title="PII Extractor", layout="wide")
+st.title("🔍 Multilingual PII Extractor (Legal Texts)")
 
-def run_ner(text: str, nlp, min_score: float):
-    spans = []
-    outputs = nlp(text)
-    for ent in outputs:
-        label = LABEL_MAP.get(ent.get("entity_group"), None)
-        if not label:
-            continue
-        score = float(ent.get("score", 0.0))
-        if score < min_score:
-            continue
-        spans.append({"label": label, "text": text[ent["start"]:ent["end"]], "score": round(score, 3)})
-    return spans
+sample_text = """1.\nP.S. (Police Thane): Bhosari \nFIR No.: 0523 \nDate and Time of FIR: \n19/11/2017 at 21:33 \nDistrict: Pune City \nYear: 2017
+Acts \nSections \n1 \n Section 25 \n3 \n Section 135
+Occurrence of offence: \nDate: 19/11/2017 \nTime: 21:09 hours
+General Diary Reference: 029
+Date To: 19/11/2017
+Time From: 17:15 hours
+Address: Shoa Hate Íya Sadma, Moya Mat, Ashita, Asaravadi, Pune"""
 
-# ----------------------------
-# Streamlit App
-# ----------------------------
+with st.container():
+    st.subheader("Enter / Paste Legal Text")
+    user_text = st.text_area("Text Input", value=sample_text, height=300)
 
-st.set_page_config(page_title="Multilingual PII Extractor (Legal OCR)", layout="wide")
-st.title("🔎 Multilingual PII Extractor for Legal OCR (EN + Indic)")
+if st.button("Extract PII"):
+    if user_text.strip() == "":
+        st.warning("⚠️ Please enter some text first.")
+    else:
+        # Run HuggingFace NER
+        ner_results = ner_pipeline(user_text)
 
-with st.sidebar:
-    st.header("Model & Settings")
-    model_name = st.text_input("HF model", value="ai4bharat/IndicNER")
-    threshold = st.slider("NER confidence threshold", 0.0, 1.0, 0.55, 0.01)
-    apply_regex = st.checkbox("Apply regex rules", value=True)
-    apply_ner = st.checkbox("Apply NER model", value=True)
-    mask_token = st.text_input("Mask token for redaction", value="▮▮▮")
+        # Convert to simpler dict
+        ner_extracted = []
+        for r in ner_results:
+            ner_extracted.append({
+                "label": r["entity_group"],
+                "text": r["word"],
+                "score": round(r["score"], 3)
+            })
 
-nlp = load_ner_pipeline(model_name)
+        # Run Regex Extractor
+        regex_results = regex_extract(user_text)
 
-sample_text = (
-    "P.S. (Police Thane): Bhosari \nFIR No.: 0523 \nDate and Time of FIR: 19/11/2017 at 21:33 \nDistrict: Pune City"
-)
+        # Merge both results
+        final_pii = ner_extracted + regex_results
 
-text = st.text_area("Paste text here", value=sample_text, height=200)
+        # Display results
+        st.subheader("📌 Extracted PII")
+        if final_pii:
+            for item in final_pii:
+                if "score" in item:
+                    st.write(f"**{item['label']}** → {item['text']} (score: {item['score']})")
+                else:
+                    st.write(f"**{item['label']}** → {item['text']}")
+        else:
+            st.info("No PII detected.")
 
-col_run, col_clear = st.columns([1, 1])
-with col_run:
-    run = st.button("Extract PII", type="primary")
-with col_clear:
-    clear = st.button("Clear")
-
-if run:
-    norm = normalize_ocr(text)
-    spans = []
-    if apply_regex:
-        spans.extend(run_regex_rules(norm))
-    if apply_ner:
-        spans.extend(run_ner(norm, nlp, threshold))
-
-    st.subheader("Results")
-    st.json(spans)
-
-elif clear:
-    st.experimental_rerun()
-
-st.markdown("---")
-st.caption("This tool extracts PII from multilingual OCR text using regex + NER.")
+        # Download as JSON
+        import json
+        st.download_button(
+            label="📥 Download PII (JSON)",
+            data=json.dumps(final_pii, indent=2, ensure_ascii=False),
+            file_name="pii_extracted.json",
+            mime="application/json"
+        )
