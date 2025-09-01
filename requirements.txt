@@ -1,9 +1,9 @@
 streamlit 
 PyPDF2 
 pdfplumber 
-PyMuPDF 
+pymupdf 
 pandas 
 pillow 
 pytesseract 
-opencv-python 
-openpyxl
+opencv-python-headless 
+numpy
