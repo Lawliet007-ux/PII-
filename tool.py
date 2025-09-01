@@ -1,10 +1,12 @@
-# fir_pii_extractor_final_pro.py
+# fir_pii_extractor_fixed.py
 """
-Final FIR PII Extractor — PRO (single-file)
-- Upload PDFs (scanned/digital) or paste text
-- Multi-step pipeline: text extraction -> cleaning -> candidate collection
-  -> NER boost -> fuzzy repair -> scoring -> final selection
+FIR PII Extractor — Fixed single-file Streamlit app
+- PDF/text input (Hindi + English)
+- Robust cleaning + Devanagari repair
+- Regex-first candidate collection -> optional NER boost -> fuzzy repair -> selection
+- Fixed: SECTION_MAX defined and used safely; helpers defined before use
 """
+
 import streamlit as st
 import fitz
 import pdfplumber
@@ -14,7 +16,7 @@ import re, os, json, unicodedata, tempfile, base64
 from typing import List, Dict, Any, Optional, Tuple
 from rapidfuzz import process, fuzz
 
-# optional transformers
+# transformers optional
 try:
     from transformers import pipeline
     TRANSFORMERS_AVAILABLE = True
@@ -22,17 +24,18 @@ except Exception:
     pipeline = None
     TRANSFORMERS_AVAILABLE = False
 
-st.set_page_config(page_title="FIR PII Extractor — FINAL PRO", layout="wide")
+st.set_page_config(page_title="FIR PII Extractor — Fixed", layout="wide")
 
-# ---------------------- Canonical data (seed lists) ----------------------
-STATE_CANON = {
-    "maharashtra": "Maharashtra", "mumbai": "Maharashtra", "pune": "Maharashtra",
-    "uttar pradesh": "Uttar Pradesh", "up": "Uttar Pradesh", "delhi": "Delhi"
-}
-DISTRICT_SEED = ["Pune", "Pune City", "Mumbai", "Mumbai City", "Nagpur", "Nashik",
-                 "Meerut", "Lucknow", "Varanasi", "Kanpur", "Noida", "Ghaziabad"]
-DISTRICT_SEED_DEV = ["पुणे", "मुंबई", "नागपूर", "नाशिक", "मेरठ", "लखनऊ", "वाराणसी", "कानपुर"]
-POLICE_PS_SEED = ["Bhosari", "Hadapsar", "Dadar", "Andheri", "Colaba", "Cyber Crime Cell"]
+# -------------------- Constants --------------------
+SECTION_MAX = 999           # maximum plausible section number to accept
+SECTION_MIN_KEEP = 10       # drop very small numbers (1..9) to avoid noise
+PLACEHOLDERS = set(["name", "नाव", "नाम", "type", "address", "of p.s.", "then name of p.s.", "of p.s", "of ps"])
+
+# small canonical seeds (extend for production)
+STATE_CANON = {"maharashtra": "Maharashtra", "uttar pradesh": "Uttar Pradesh", "delhi": "Delhi"}
+DISTRICT_SEED_EN = ["Pune", "Mumbai", "Meerut", "Lucknow", "Varanasi", "Kanpur"]
+DISTRICT_SEED_DEV = ["पुणे", "मुंबई", "मेरठ", "लखनऊ", "वाराणसी", "कानपुर"]
+POLICE_PS_SEED = ["Bhosari", "Hadapsar", "Dadar", "Andheri"]
 POLICE_PS_SEED_DEV = ["भोसरी", "हडपसर", "डादर", "अंधेरी"]
 
 KNOWN_ACTS = {
@@ -47,11 +50,8 @@ KNOWN_ACTS = {
     "maharashtra police": "Maharashtra Police Act 1951"
 }
 
-PLACEHOLDERS = set(["name", "नाव", "नाम", "type", "address", "of p.s.", "then name of p.s.", "of p.s", "of ps"])
+# -------------------- Basic helpers --------------------
 
-SECTION_MIN_KEEP = 10   # discard sections below this to avoid noise like 1,2,3
-
-# ---------------------- Helper functions ----------------------
 def dedupe_preserve_order(items: List[str]) -> List[str]:
     seen = set()
     out = []
@@ -70,7 +70,7 @@ def remove_control_chars(s: str) -> str:
     return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
 
 def strip_nonessential_unicode(s: str) -> str:
-    # Keep ASCII, Devanagari, punctuation; remove weird other codepoints
+    # keep ASCII, Devanagari and common punctuation; drop others
     return re.sub(r"[^\x00-\x7F\u0900-\u097F\u2000-\u206F\u20B9\n\t:;.,/()\-—]", " ", s)
 
 def collapse_spaces(s: str) -> str:
@@ -79,7 +79,7 @@ def collapse_spaces(s: str) -> str:
     return s.strip()
 
 def fix_broken_devanagari_runs(s: str) -> str:
-    # Collapse spaces between Devanagari letters (iteratively)
+    # collapse spaces between devanagari letters iteratively
     def once(x):
         return re.sub(r"([\u0900-\u097F])\s+([\u0900-\u097F])", r"\1\2", x)
     prev = None
@@ -107,15 +107,14 @@ def filter_placeholder_candidate(c: Optional[str]) -> Optional[str]:
     if not v:
         return None
     low = v.lower()
-    # reject obvious placeholders or label-fragments
     if low in PLACEHOLDERS or re.search(r"\b(of p\.?s\.?|then name of p\.?s\.?)\b", low):
         return None
-    # if too short after stripping non-alnum
     if len(re.sub(r"\W+", "", v)) < 2:
         return None
     return v
 
-# ---------------------- Text extraction from PDF ----------------------
+# -------------------- PDF -> text extraction --------------------
+
 def extract_text_pymupdf(path: str) -> str:
     try:
         doc = fitz.open(path)
@@ -161,7 +160,8 @@ def extract_text_from_pdf(path: str, tesseract_langs: str = "eng+hin+mar") -> st
             txt = ocr
     return canonicalize_text(txt)
 
-# ---------------------- NER loader (optional) ----------------------
+# -------------------- Optional NER loader --------------------
+
 @st.cache_resource
 def load_ner_pipe():
     if not TRANSFORMERS_AVAILABLE:
@@ -174,13 +174,16 @@ def load_ner_pipe():
     except Exception:
         return None
 
-# ---------------------- Candidate finders (regex-heavy) ----------------------
+# -------------------- Candidate collection (regex) --------------------
+
 def find_year_candidates(text: str) -> List[str]:
     out = []
     m = re.search(r"(?:Year|वर्ष|Date of FIR|Date)\s*[:\-]?\s*((?:19|20)\d{2})", text, re.IGNORECASE)
-    if m: out.append(m.group(1))
+    if m:
+        out.append(m.group(1))
     m2 = re.search(r"\b(19|20)\d{2}\b", text)
-    if m2: out.append(m2.group(0))
+    if m2:
+        out.append(m2.group(0))
     return dedupe_preserve_order(out)
 
 def find_district_candidates(text: str) -> List[str]:
@@ -212,7 +215,6 @@ def find_acts_candidates(text: str) -> List[str]:
     for k in KNOWN_ACTS.keys():
         if re.search(re.escape(k), text, re.IGNORECASE):
             found.append(KNOWN_ACTS[k])
-    # also capture Act lines
     for m in re.finditer(r"(?:Act|अधिनियम|कायदा)[^\n]{0,120}", text, re.IGNORECASE):
         chunk = m.group(0)
         for k in KNOWN_ACTS.keys():
@@ -222,19 +224,27 @@ def find_acts_candidates(text: str) -> List[str]:
 
 def find_section_candidates(text: str) -> List[str]:
     secs = []
+    # look near section labels
     for m in re.finditer(r"(?:Section|Sections|U\/s|U\/s\.|धारा|कलम|Sect)\b", text, re.IGNORECASE):
         window = text[m.start(): m.start()+300]
         nums = re.findall(r"\b\d{1,3}[A-Z]?(?:\([0-9A-Za-z]+\))?\b", window)
         for n in nums:
             base = re.match(r"(\d{1,3})", n)
             if base:
-                v = int(base.group(1))
+                try:
+                    v = int(base.group(1))
+                except Exception:
+                    continue
                 if 1 <= v <= SECTION_MAX:
                     secs.append(str(v))
+    # fallback: global numeric occurrences but keep only >= SECTION_MIN_KEEP
     if not secs:
         nums = re.findall(r"\b\d{1,3}\b", text)
         for n in nums:
-            v = int(n)
+            try:
+                v = int(n)
+            except Exception:
+                continue
             if v >= SECTION_MIN_KEEP and v <= SECTION_MAX:
                 secs.append(str(v))
     return dedupe_preserve_order(secs)
@@ -249,7 +259,7 @@ def find_name_candidates(text: str) -> List[str]:
         for m in re.finditer(p, text, re.IGNORECASE):
             v = m.group(1).strip()
             out.append(v)
-    # light fallback: capitalized English name sequences (risky)
+    # Light fallback: English capitalized name sequences (risky — kept as fallback)
     for m in re.finditer(r"\b([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,3})\b", text):
         out.append(m.group(1).strip())
     return dedupe_preserve_order(out)
@@ -264,7 +274,8 @@ def find_address_candidates(text: str) -> List[str]:
         out.append(m.group(0).strip())
     return dedupe_preserve_order(out)
 
-# ---------------------- NER booster ----------------------
+# -------------------- NER booster --------------------
+
 def ner_boost(text: str, ner_pipe) -> Dict[str, List[str]]:
     res = {"PER": [], "LOC": [], "ORG": []}
     if ner_pipe is None:
@@ -289,7 +300,8 @@ def ner_boost(text: str, ner_pipe) -> Dict[str, List[str]]:
         res[k] = dedupe_preserve_order(res[k])
     return res
 
-# ---------------------- Fuzzy repair ----------------------
+# -------------------- Fuzzy repair --------------------
+
 def fuzzy_repair_to_list(candidate: str, choices: List[str], threshold: int = 70) -> str:
     if not candidate or not choices:
         return candidate
@@ -299,7 +311,8 @@ def fuzzy_repair_to_list(candidate: str, choices: List[str], threshold: int = 70
         return best[0]
     return candidate
 
-# ---------------------- Candidate scoring ----------------------
+# -------------------- Scoring --------------------
+
 def choose_best(candidates: List[Tuple[str, str]]) -> Optional[str]:
     if not candidates:
         return None
@@ -312,7 +325,6 @@ def choose_best(candidates: List[Tuple[str, str]]) -> Optional[str]:
         if not v:
             continue
         score = weights.get(src, 50)
-        # slight boost for reasonable length
         score += min(len(v), 60) / 6
         scored.append((score, v))
     if not scored:
@@ -320,11 +332,11 @@ def choose_best(candidates: List[Tuple[str, str]]) -> Optional[str]:
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
-# ---------------------- Orchestrator ----------------------
+# -------------------- Orchestrator --------------------
+
 def extract_all_fields(text: str, use_ner: bool = True, ner_pipe=None) -> Dict[str, Any]:
     t = canonicalize_text(text)
 
-    # collect candidates
     year_c = find_year_candidates(t)
     dist_c = find_district_candidates(t)
     ps_c = find_police_station_candidates(t)
@@ -333,18 +345,18 @@ def extract_all_fields(text: str, use_ner: bool = True, ner_pipe=None) -> Dict[s
     name_c = find_name_candidates(t)
     addr_c = find_address_candidates(t)
 
-    ner_cands = {"PER": [], "LOC": [], "ORG": []}
+    ner_c = {"PER": [], "LOC": [], "ORG": []}
     if use_ner and TRANSFORMERS_AVAILABLE and ner_pipe is not None:
-        ner_cands = ner_boost(t, ner_pipe)
+        ner_c = ner_boost(t, ner_pipe)
 
-    # assemble source-tagged candidates
     year_list = [(y, "label") for y in year_c]
-    district_list = [(d, "label") for d in dist_c] + [(l, "ner") for l in ner_cands.get("LOC", [])]
-    ps_list = [(p, "label") for p in ps_c]
-    name_list = [(n, "label") for n in name_c] + [(p, "ner") for p in ner_cands.get("PER", [])]
-    addr_list = [(a, "label") for a in addr_c] + [(l, "ner") for l in ner_cands.get("LOC", [])]
 
-    # fuzzy repair seeds
+    district_list = [(d, "label") for d in dist_c] + [(l, "ner") for l in ner_c.get("LOC", [])]
+    ps_list = [(p, "label") for p in ps_c]
+    name_list = [(n, "label") for n in name_c] + [(p, "ner") for p in ner_c.get("PER", [])]
+    addr_list = [(a, "label") for a in addr_c] + [(l, "ner") for l in ner_c.get("LOC", [])]
+
+    # fuzzy repair attempts
     district_rep = []
     for val, src in district_list:
         rep = fuzzy_repair_to_list(val, DISTRICT_SEED + DISTRICT_SEED_DEV, threshold=65)
@@ -361,44 +373,39 @@ def extract_all_fields(text: str, use_ner: bool = True, ner_pipe=None) -> Dict[s
         else:
             ps_rep.append((val, src))
 
-    # finalize selections
     year_best = choose_best(year_list)
     dist_best = choose_best(district_rep)
     ps_best = choose_best(ps_rep)
     name_best = choose_best(name_list)
     addr_best = choose_best(addr_list)
 
-    # acts normalization
     acts_final = acts_c if acts_c else None
-
-    # sections filtered & unique
     sections_final = sections_c if sections_c else None
 
     # state inference
     state_best = None
     for k, v in STATE_CANON.items():
         if k in t.lower() or v.lower() in t.lower():
-            state_best = v; break
+            state_best = v
+            break
     if not state_best and dist_best:
-        if any(x.lower() in dist_best.lower() for x in ["pune","mumbai","nagpur"]):
+        if any(x.lower() in dist_best.lower() for x in ["pune", "मुंबई", "nagpur"]):
             state_best = "Maharashtra"
-        elif any(x.lower() in dist_best.lower() for x in ["meerut","lucknow","kanpur"]):
+        elif any(x.lower() in dist_best.lower() for x in ["meerut", "लखनऊ", "kanpur"]):
             state_best = "Uttar Pradesh"
 
-    # oparty detection
     oparty_best = None
     if re.search(r"\b(accused|आरोपी|प्रतिवादी)\b", t, re.IGNORECASE):
         oparty_best = "Accused"
     elif re.search(r"\b(complainant|informant|तक्रारदार|सूचक)\b", t, re.IGNORECASE):
         oparty_best = "Complainant"
 
-    # category mapping (simple rules)
     revised_cat = "OTHER"
     if acts_final and any("Information Technology" in a or "IT Act" in a for a in acts_final):
         revised_cat = "CYBER_CRIME"
     if sections_final:
         sset = set(sections_final)
-        if any(x in sset for x in ("354","376","509")):
+        if any(x in sset for x in ("354", "376", "509")):
             revised_cat = "SEXUAL_OFFENCE"
         elif "302" in sset:
             revised_cat = "MURDER"
@@ -424,7 +431,7 @@ def extract_all_fields(text: str, use_ner: bool = True, ner_pipe=None) -> Dict[s
         "jurisdiction_type": jurisdiction_type
     }
 
-    # Final cleanup: trim huge strings and replace obvious placeholders with None
+    # final safety cleanup
     for k, v in list(out.items()):
         if isinstance(v, str):
             if len(v) > 1000:
@@ -433,15 +440,16 @@ def extract_all_fields(text: str, use_ner: bool = True, ner_pipe=None) -> Dict[s
                 out[k] = None
     return out
 
-# ---------------------- Streamlit UI ----------------------
-st.title("FIR PII Extractor — FINAL PRO")
-st.write("Upload FIR PDFs (scanned/digital) or paste FIR text. The pipeline: OCR -> clean -> candidate collect -> NER (opt) -> fuzzy repair -> final selection.")
+# -------------------- Streamlit UI --------------------
+
+st.title("FIR PII Extractor — FIXED")
+st.write("Upload FIR PDFs or paste FIR text. This is the fixed, robust single-file extractor.")
 
 with st.sidebar:
     st.header("Settings")
     use_ner = st.checkbox("Use NER fallback (if available)", value=TRANSFORMERS_AVAILABLE)
     tesseract_langs = st.text_input("Tesseract languages", value="eng+hin+mar")
-    st.markdown("Install tesseract language packs (hin, mar) on the server for best OCR results.")
+    st.markdown("Install tesseract language packs (hin, mar) for better Devanagari OCR.")
 
 uploaded = st.file_uploader("Upload FIR PDFs", type=["pdf"], accept_multiple_files=True)
 pasted = st.text_area("Or paste FIR text here", height=300)
@@ -450,6 +458,7 @@ ner_pipe = load_ner_pipe() if (use_ner and TRANSFORMERS_AVAILABLE) else None
 
 if st.button("Extract PII"):
     results = {}
+    # PDFs
     if uploaded:
         for f in uploaded:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -457,12 +466,12 @@ if st.button("Extract PII"):
             try:
                 txt = extract_text_from_pdf(tmp_path, tesseract_langs=tesseract_langs)
                 if not txt.strip():
-                    st.warning(f"No text extracted from {f.name}")
-                res = extract_all_fields(txt, use_ner=use_ner, ner_pipe=ner_pipe)
-                results[f.name] = res
+                    st.warning(f"No text could be extracted from {f.name}")
+                results[f.name] = extract_all_fields(txt, use_ner=use_ner, ner_pipe=ner_pipe)
             finally:
                 try: os.remove(tmp_path)
                 except: pass
+    # pasted
     if pasted and pasted.strip():
         txt = canonicalize_text(pasted)
         results["pasted_text"] = extract_all_fields(txt, use_ner=use_ner, ner_pipe=ner_pipe)
@@ -470,9 +479,9 @@ if st.button("Extract PII"):
     if not results:
         st.warning("Please upload PDF(s) or paste FIR text.")
     else:
-        st.subheader("Extracted PII (best-effort)")
+        st.subheader("Extracted PII (result)")
         st.json(results, expanded=True)
         out_json = json.dumps(results, ensure_ascii=False, indent=2)
         b64 = base64.b64encode(out_json.encode()).decode()
         st.markdown(f"[Download JSON](data:application/json;base64,{b64})")
-        st.success("Extraction complete. If a particular FIR remains noisy, upload that PDF and I'll show intermediate candidates to tune fuzzy lists.")
+        st.success("Done — extraction complete.")
