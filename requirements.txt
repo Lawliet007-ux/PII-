@@ -8,5 +8,4 @@ regex
 langdetect 
 transformers 
 torch
-tesseract-ocr 
-tesseract-ocr-hin
+
