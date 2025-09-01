@@ -341,13 +341,19 @@ def extract_name_by_label(text: str) -> Optional[str]:
     return None
 
 def extract_address_by_label(text: str) -> Optional[str]:
-    m = re.search(r"(?:Address|पत्ता|पत्ता[:\-\)]*)\s*[:\-]?\s*([A-Za-z0-9\u0900-\u097F,./\\- ]{4,200})", text, re.IGNORECASE)
+    # match "Address" or "पत्ता", followed by colon/dash, then capture up to 200 chars
+    m = re.search(
+        r"(?:Address|पत्ता)\s*[:\-]?\s*([A-Za-z0-9\u0900-\u097F,./\- ]{4,200})",
+        text,
+        re.IGNORECASE
+    )
     if m:
         addr = m.group(1).strip()
-        # stop at 'Phone' or 'Mobile' or next labeled field
-        addr = re.split(r"(?:Phone|Mobile|मोबा|फोन|UID|Passport|यु|Passport|Mob:)", addr)[0].strip()
+        # stop at phone/mobile/UID labels if they appear
+        addr = re.split(r"(?:Phone|Mobile|मोबा|फोन|UID|Passport)", addr)[0].strip()
         return addr
     return None
+
 
 # ---------------- Master extraction ----------------
 
