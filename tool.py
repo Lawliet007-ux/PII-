@@ -1,73 +1,11 @@
-"""
-Streamlit app: FIR PII extractor (Hindi + English)
-Updated with improved cleaning, normalization, and filtering of results.
-"""
+
 
 import streamlit as st
-import fitz  # PyMuPDF
-import pdfplumber
-import pytesseract
-from PIL import Image
-import io
 import re
 import json
-import tempfile
-import os
 import base64
 
-st.set_page_config(page_title="FIR PII Extractor — Hindi + English", layout="wide")
-
-# ------------------ Helpers ------------------
-
-def extract_text_pymupdf(path):
-    try:
-        doc = fitz.open(path)
-        pages = [p.get_text("text") for p in doc]
-        return pages
-    except Exception as e:
-        return None
-
-def extract_text_pdfplumber(path):
-    try:
-        pages = []
-        with pdfplumber.open(path) as pdf:
-            for p in pdf.pages:
-                text = p.extract_text()
-                pages.append(text or "")
-        return pages
-    except Exception:
-        return None
-
-def render_pages_to_images(path, zoom=2):
-    images = []
-    doc = fitz.open(path)
-    for page in doc:
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
-    return images
-
-def ocr_images(images, tesseract_langs="eng+hin"):
-    texts = []
-    for img in images:
-        gray = img.convert("L")
-        txt = pytesseract.image_to_string(gray, lang=tesseract_langs)
-        texts.append(txt)
-    return texts
-
-# Combined extractor
-def extract_text_from_pdf(path):
-    pages = extract_text_pymupdf(path)
-    combined = "\n".join([p or "" for p in pages]) if pages else ""
-    if not combined or len(combined) < 100:
-        pages = extract_text_pdfplumber(path)
-        combined = "\n".join([p or "" for p in pages]) if pages else ""
-    if not combined or len(combined) < 150:
-        images = render_pages_to_images(path)
-        pages = ocr_images(images)
-        combined = "\n".join([p or "" for p in pages])
-    return pages, combined
+st.set_page_config(page_title="FIR PII Extractor — Paste Text Version", layout="wide")
 
 # ------------------ Improved Extraction ------------------
 
@@ -112,7 +50,6 @@ def extract_pii_rules(text):
         except:
             pass
     sections_filtered = list(dict.fromkeys(sections_filtered))
-    # keep only relevant FIR-related sections
     keep_sections = [sec for sec in sections_filtered if sec in ["25", "3", "135", "37", "323", "427", "506", "509"]]
     result["under_sections"] = keep_sections
 
@@ -154,33 +91,18 @@ def extract_pii_rules(text):
 
 # ------------------ Streamlit UI ------------------
 
-st.title("FIR PII Extractor — Hindi + English")
-st.write("Upload PDFs (scanned or selectable). The app will try selectable text first and fallback to OCR.")
+st.title("FIR PII Extractor — Paste Text Version")
+st.write("Paste FIR text (e.g., from Elasticsearch) below to extract structured PII.")
 
-uploaded_files = st.file_uploader("Upload one or more FIR PDFs", type=["pdf"], accept_multiple_files=True)
+raw_text = st.text_area("Paste FIR text here", height=300)
 
-if uploaded_files:
-    results = {}
-    for uploaded in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
-        st.write(f"Processing **{uploaded.name}**")
-        pages, combined_text = extract_text_from_pdf(tmp_path)
-        st.expander("Show raw extracted text (first 2000 chars)", expanded=False).write(combined_text[:2000])
-        pii = extract_pii_rules(combined_text)
-        results[uploaded.name] = pii
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-    st.subheader("Extracted PII (per file)")
-    st.json(results)
-
-    b64 = base64.b64encode(json.dumps(results, ensure_ascii=False, indent=2).encode()).decode()
-    href = f"data:application/json;base64,{b64}"
-    st.markdown(f"[Download JSON]({href})")
-
-else:
-    st.write("No files uploaded yet — drop a PDF to get started.")
+if st.button("Extract PII"):
+    if raw_text.strip():
+        pii = extract_pii_rules(raw_text)
+        st.subheader("Extracted PII")
+        st.json(pii)
+        b64 = base64.b64encode(json.dumps(pii, ensure_ascii=False, indent=2).encode()).decode()
+        href = f"data:application/json;base64,{b64}"
+        st.markdown(f"[Download JSON]({href})")
+    else:
+        st.warning("Please paste some text to extract.")
