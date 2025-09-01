@@ -1,5 +1,9 @@
-streamlit
+streamlit 
 PyPDF2 
 pdfplumber 
 PyMuPDF 
-pandas
+pandas 
+pillow 
+pytesseract 
+opencv-python 
+openpyxl
