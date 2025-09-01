@@ -3,3 +3,8 @@ PyPDF2
 pdfplumber 
 PyMuPDF 
 pandas
+re
+datetime
+io
+typing
+json
