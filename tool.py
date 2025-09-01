@@ -638,7 +638,7 @@ def post_process_extracted_names(names: List[str]) -> List[str]:
     for name in names:
         # Remove common prefixes/suffixes
         name = re.sub(r'^(Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Prof\.?)', '', name, flags=re.IGNORECASE)
-        name = re.sub(r'(Jr\.?|Sr\.?|III?|IV?), '', name, flags=re.IGNORECASE)
+        name = re.sub(r'(Jr\.?|Sr\.?|III?|IV?)', '', name, flags=re.IGNORECASE)
         
         # Clean whitespace
         name = ' '.join(name.split())
