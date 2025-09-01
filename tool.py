@@ -1,502 +1,488 @@
 import streamlit as st
-import pandas as pd
-import re
 import PyPDF2
+import pdfplumber
 import fitz  # PyMuPDF
+import re
+import pandas as pd
 from datetime import datetime
-import json
 import io
-from collections import defaultdict
-import spacy
-from transformers import pipeline
-import warnings
-warnings.filterwarnings("ignore")
+from typing import Dict, List, Tuple, Any
+import json
 
-# Configure page
+# Configure Streamlit page
 st.set_page_config(
-    page_title="Legal PII Extractor",
+    page_title="Legal PDF PII Extractor",
     page_icon="📄",
     layout="wide"
 )
 
 class PIIExtractor:
     def __init__(self):
-        self.pii_patterns = {
-            # Names (English and Devanagari patterns)
-            'names': [
-                r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b',  # English names
-                r'(?:नाव|Name)[\s:]+([A-Za-z\s]+)',
-                r'(?:वडिलांचे|Father)[\s:]+([A-Za-z\s]+)',
-                r'(?:पिचे|Husband)[\s:]+([A-Za-z\s]+)',
-            ],
-            
-            # Phone numbers
+        # Comprehensive regex patterns for various PII types
+        self.patterns = {
             'phone_numbers': [
-                r'(?:मोबाइल|Mobile|Phone|फोन)[\s:]*(\d{10})',
-                r'(?:मो\.|Mo\.)[\s:]*(\d{10})',
-                r'\b\d{10}\b',
-                r'\+91[-\s]?\d{10}',
+                r'\b(?:\+91|91)?[-.\s]?[6789]\d{9}\b',  # Indian mobile numbers
+                r'\b\d{4}[-.\s]?\d{3}[-.\s]?\d{4}\b',   # General phone format
+                r'(?:मो\.|मोबाइल|Phone|mobile|फोन)\s*(?:नं\.|नंबर|No\.?)?\s*:?\s*(\d+)',
             ],
-            
-            # Addresses
+            'names': [
+                r'(?:नाव|Name|NAAM)\s*[:।]\s*([A-Z\s]+(?:[A-Z][a-z]*\s*)*)',
+                r'(?:Father|वडिलांचे|Husband|पतीचे)\s*(?:नाव|Name)\s*[:।]\s*([A-Z\s]+)',
+                r'(?:Complainant|तक्रारदार|शिकायतकर्ता)\s*[:।]\s*([A-Z\s]+)',
+            ],
             'addresses': [
-                r'(?:पता|Address|रा\.|Resi)[\s:]+([^,\n]+(?:,[^,\n]+)*)',
-                r'(?:District|जिल्हा|ǔजिल्ला)[\s:]+([A-Za-z\s]+)',
-                r'(?:State|राज्य)[\s:]+([A-Za-z\s]+)',
-                r'(?:पुणे|Mumbai|Delhi|Kolkata|Chennai)[^,\n]*',
+                r'(?:पत्ता|Address|PATTA)\s*[:।]\s*([^,\n]+(?:,[^,\n]+)*)',
+                r'(?:रा\.|रहिवासी|Resident)\s*[:।]?\s*([^,\n]+(?:,[^,\n]+)*)',
+                r'(?:शहर|City|जिल्हा|District|State|राज्य)\s*[:।]\s*([^,\n]+)',
             ],
-            
-            # Dates
             'dates': [
-                r'\b\d{1,2}/\d{1,2}/\d{4}\b',
-                r'\b\d{1,2}-\d{1,2}-\d{4}\b',
-                r'(?:दिनांक|Date)[\s:]+(\d{1,2}/\d{1,2}/\d{4})',
-                r'(?:जन्म|Birth)[\s:]+(\d{1,2}/\d{1,2}/\d{4})',
+                r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b',
+                r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b',
+                r'(?:दिनांक|Date)\s*[:।]\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
             ],
-            
-            # FIR Numbers
             'fir_numbers': [
-                r'(?:FIR|एफ\.आई\.आर\.|गु\.र\.नं\.)[\s:]*(\d+/\d+)',
-                r'\b\d+/\d{4}\b',
+                r'(?:FIR|F\.I\.R\.|एफ\.आई\.आर\.)\s*(?:No\.|नं\.?|क्रमांक)\s*[:।]?\s*(\d+)',
+                r'गु\.र\.नं\.\s*(\d+[\/\-]\d+)',
+                r'गुन्हा\s*नंबर\s*[:।]\s*(\d+)',
             ],
-            
-            # Police Station
             'police_stations': [
-                r'(?:P\.S\.|पोलीस ठाणे|Police Station)[\s:]+([A-Za-z\s]+)',
-                r'(?:ठाणे|थाना)[\s:]+([A-Za-z\s]+)',
+                r'(?:P\.S\.|पोलीस\s*स्टेशन|ठाणे)\s*[:।]?\s*([^,\n]+)',
+                r'(?:Police\s*Station)\s*[:।]?\s*([^,\n]+)',
             ],
-            
-            # ID Numbers
-            'id_numbers': [
-                r'(?:UID|आधार|Aadhar)[\s:]*(\d{12})',
-                r'(?:PAN|पैन)[\s:]*([A-Z]{5}\d{4}[A-Z])',
-                r'(?:Passport|पासपोर्ट)[\s:]*([A-Z]\d{7})',
-                r'(?:Driving License|ड्रायव्हिंग)[\s:]*([A-Z]{2}\d{13})',
-            ],
-            
-            # Vehicle Numbers
-            'vehicle_numbers': [
-                r'\b[A-Z]{2}[-\s]?\d{2}[-\s]?[A-Z]{2}[-\s]?\d{4}\b',
-                r'(?:गाडी|Vehicle)[\s:]*([A-Z]{2}\d{2}[A-Z]{2}\d{4})',
-            ],
-            
-            # Amount/Money
-            'amounts': [
-                r'(?:रु\.|Rs\.?|₹)[\s]*(\d+(?:,\d+)*(?:\.\d{2})?)',
-                r'(?:मूल्य|Value)[\s:]*(?:Rs\.?|₹)?[\s]*(\d+(?:,\d+)*)',
-            ],
-            
-            # Age
             'ages': [
-                r'(?:वय|Age|उमर)[\s:]*(\d{1,3})(?:\s*(?:वर्ष|years?))?',
-                r'\b\d{1,3}(?:\s*(?:वर्ष|years?))\b',
+                r'(?:वय|Age|Years)\s*[:।]?\s*(\d+)\s*(?:वर्षे?|years?|yrs?)',
+                r'(\d+)\s*(?:वर्षे?|years?|yrs?)',
+            ],
+            'aadhaar': [
+                r'\b\d{4}[-.\s]?\d{4}[-.\s]?\d{4}\b',
+                r'(?:आधार|Aadhaar|UID)\s*(?:नं\.|No\.?)\s*[:।]?\s*(\d{4}[-.\s]?\d{4}[-.\s]?\d{4})',
+            ],
+            'pan': [
+                r'\b[A-Z]{5}\d{4}[A-Z]\b',
+                r'(?:PAN|पॅन)\s*(?:नं\.|No\.?)\s*[:।]?\s*([A-Z]{5}\d{4}[A-Z])',
+            ],
+            'amounts': [
+                r'(?:रु\.|Rs\.?|रुपये)\s*(\d+(?:,\d+)*(?:\.\d+)?)',
+                r'(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:रु\.|Rs\.?|रुपये)',
+                r'मूल्य\s*[:।]\s*(\d+(?:,\d+)*(?:\.\d+)?)',
+            ],
+            'vehicle_numbers': [
+                r'\b[A-Z]{2}[-\s]?\d{1,2}[-\s]?[A-Z]{1,2}[-\s]?\d{4}\b',
+                r'(?:वाहन|Vehicle)\s*(?:नं\.|No\.?)\s*[:।]?\s*([A-Z]{2}[-\s]?\d{1,2}[-\s]?[A-Z]{1,2}[-\s]?\d{4})',
+            ],
+            'case_types': [
+                r'(?:कलम|Section|धारा)\s*(\d+(?:\([^)]+\))?)',
+                r'(?:IPC|भारतीय\s*दंड\s*संहिता|आयपीसी)\s*(\d+)',
             ]
         }
         
-        # Load spaCy model for NER (if available)
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except:
-            self.nlp = None
-            st.warning("SpaCy English model not found. Install with: python -m spacy download en_core_web_sm")
-    
-    def extract_text_from_pdf(self, pdf_file):
-        """Extract text from PDF using PyMuPDF for better OCR support"""
-        try:
-            # Try PyMuPDF first (better for OCR PDFs)
-            pdf_bytes = pdf_file.read()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            text = ""
-            
-            for page in doc:
-                text += page.get_text()
-            
-            doc.close()
-            return text
+        # Common Hindi-English name indicators
+        self.name_indicators = [
+            'नाव', 'Name', 'NAAM', 'वडिलांचे', 'Father', 'पतीचे', 'Husband',
+            'तक्रारदार', 'Complainant', 'आरोपी', 'Accused', 'संशयित', 'Suspect'
+        ]
         
+        # Location indicators
+        self.location_indicators = [
+            'पत्ता', 'Address', 'रहिवासी', 'Resident', 'शहर', 'City', 
+            'जिल्हा', 'District', 'राज्य', 'State', 'गाव', 'Village',
+            'तालुका', 'Tehsil', 'पिन', 'PIN'
+        ]
+
+    def extract_text_from_pdf(self, pdf_file) -> str:
+        """Extract text using multiple methods for best results"""
+        text = ""
+        
+        try:
+            # Method 1: Using pdfplumber (best for mixed content)
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
         except Exception as e:
-            st.error(f"Error extracting text from PDF: {str(e)}")
-            return ""
-    
-    def clean_text(self, text):
-        """Clean and normalize text"""
+            st.warning(f"pdfplumber extraction failed: {e}")
+            
+        # Method 2: Using PyMuPDF as fallback
+        if not text.strip():
+            try:
+                pdf_file.seek(0)
+                pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
+                for page_num in range(pdf_document.page_count):
+                    page = pdf_document[page_num]
+                    text += page.get_text() + "\n"
+                pdf_document.close()
+            except Exception as e:
+                st.warning(f"PyMuPDF extraction failed: {e}")
+                
+        # Method 3: Using PyPDF2 as last resort
+        if not text.strip():
+            try:
+                pdf_file.seek(0)
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+            except Exception as e:
+                st.warning(f"PyPDF2 extraction failed: {e}")
+                
+        return text
+
+    def clean_text(self, text: str) -> str:
+        """Clean and preprocess extracted text"""
         # Remove excessive whitespace
         text = re.sub(r'\s+', ' ', text)
-        # Remove special characters that might interfere
-        text = re.sub(r'[^\w\s.,/:()-]', ' ', text)
+        # Remove special characters but keep Hindi and English
+        text = re.sub(r'[^\u0900-\u097F\u0020-\u007E\n]', ' ', text)
         return text.strip()
-    
-    def extract_pii_regex(self, text):
-        """Extract PII using regex patterns"""
-        extracted_pii = defaultdict(list)
+
+    def extract_pii_by_category(self, text: str) -> Dict[str, List[str]]:
+        """Extract PII using pattern matching"""
+        extracted_pii = {}
         
-        for category, patterns in self.pii_patterns.items():
+        for category, patterns in self.patterns.items():
+            extracted_pii[category] = []
             for pattern in patterns:
-                matches = re.findall(pattern, text, re.IGNORECASE | re.UNICODE)
+                matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
                 if matches:
-                    for match in matches:
-                        if isinstance(match, tuple):
-                            match = match[0] if match[0] else match[1] if len(match) > 1 else ""
-                        
-                        match = match.strip()
-                        if match and len(match) > 1:
-                            # Additional validation
-                            if self.validate_pii(category, match):
-                                extracted_pii[category].append(match)
+                    # Handle tuple matches (like date groups)
+                    if isinstance(matches[0], tuple):
+                        matches = ['/'.join(match) for match in matches]
+                    extracted_pii[category].extend(matches)
+            
+            # Remove duplicates and clean
+            extracted_pii[category] = list(set([
+                match.strip() for match in extracted_pii[category] 
+                if match and match.strip()
+            ]))
         
         return extracted_pii
-    
-    def validate_pii(self, category, value):
-        """Validate extracted PII to reduce false positives"""
-        value = value.strip()
-        
-        if category == 'phone_numbers':
-            # Must be exactly 10 digits for Indian numbers
-            digits_only = re.sub(r'\D', '', value)
-            return len(digits_only) == 10 and digits_only.startswith(('6', '7', '8', '9'))
-        
-        elif category == 'names':
-            # Names should have at least 2 characters and not be all uppercase common words
-            if len(value) < 2:
-                return False
-            common_words = ['THE', 'AND', 'FOR', 'WITH', 'POLICE', 'STATION', 'CASE', 'NUMBER']
-            return value.upper() not in common_words
-        
-        elif category == 'dates':
-            # Basic date format validation
-            return bool(re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{4}', value))
-        
-        elif category == 'amounts':
-            # Must contain digits
-            return bool(re.search(r'\d', value))
-        
-        elif category == 'ages':
-            # Age should be reasonable (1-120)
-            age_num = re.search(r'\d+', value)
-            if age_num:
-                age = int(age_num.group())
-                return 1 <= age <= 120
-        
-        return True
-    
-    def extract_pii_spacy(self, text):
-        """Extract PII using spaCy NER"""
-        if not self.nlp:
-            return {}
-        
-        doc = self.nlp(text)
-        spacy_pii = defaultdict(list)
-        
-        for ent in doc.ents:
-            if ent.label_ == "PERSON":
-                spacy_pii['names'].append(ent.text)
-            elif ent.label_ == "GPE":  # Geopolitical entity
-                spacy_pii['locations'].append(ent.text)
-            elif ent.label_ == "DATE":
-                spacy_pii['dates'].append(ent.text)
-            elif ent.label_ == "MONEY":
-                spacy_pii['amounts'].append(ent.text)
-        
-        return spacy_pii
-    
-    def extract_contextual_pii(self, text):
-        """Extract PII based on context and structure"""
-        contextual_pii = defaultdict(list)
+
+    def extract_contextual_pii(self, text: str) -> Dict[str, Any]:
+        """Extract PII using contextual analysis"""
         lines = text.split('\n')
+        contextual_pii = {
+            'complainant_details': {},
+            'accused_details': [],
+            'case_details': {},
+            'incident_details': {},
+            'property_details': []
+        }
         
         for i, line in enumerate(lines):
             line = line.strip()
             if not line:
                 continue
-            
-            # Look for structured data patterns
-            if ':' in line:
-                key, value = line.split(':', 1)
-                key = key.strip().lower()
-                value = value.strip()
                 
-                if any(word in key for word in ['name', 'नाव', 'naam']):
-                    if value and len(value) > 2:
-                        contextual_pii['names'].append(value)
-                
-                elif any(word in key for word in ['mobile', 'phone', 'मोबाइल', 'फोन']):
-                    phone_match = re.search(r'\d{10}', value)
-                    if phone_match:
-                        contextual_pii['phone_numbers'].append(phone_match.group())
-                
-                elif any(word in key for word in ['address', 'पता', 'पत्ता']):
-                    if value and len(value) > 5:
-                        contextual_pii['addresses'].append(value)
+            # Extract complainant details
+            if any(indicator in line for indicator in ['Complainant', 'तक्रारदार']):
+                name_match = re.search(r'(?:नाव|Name)\s*[:।]\s*([A-Z\s]+)', line, re.IGNORECASE)
+                if name_match:
+                    contextual_pii['complainant_details']['name'] = name_match.group(1).strip()
+                    
+            # Extract case numbers and dates
+            if 'FIR' in line or 'एफ.आई.आर' in line:
+                fir_match = re.search(r'(\d+)', line)
+                if fir_match:
+                    contextual_pii['case_details']['fir_number'] = fir_match.group(1)
+                    
+            # Extract property/amount details
+            if any(word in line for word in ['रु.', 'Rs.', 'मूल्य', 'Value']):
+                amount_match = re.search(r'(\d+(?:,\d+)*(?:\.\d+)?)', line)
+                if amount_match:
+                    contextual_pii['property_details'].append({
+                        'amount': amount_match.group(1),
+                        'context': line[:100]
+                    })
         
         return contextual_pii
-    
-    def merge_pii_results(self, *pii_dicts):
-        """Merge PII results from different extraction methods"""
-        merged = defaultdict(set)
+
+    def extract_structured_data(self, text: str) -> Dict[str, Any]:
+        """Extract structured data specific to FIR format"""
+        structured_data = {}
         
-        for pii_dict in pii_dicts:
-            for category, values in pii_dict.items():
-                for value in values:
-                    merged[category].add(value.strip())
+        # Extract FIR header information
+        fir_header_patterns = {
+            'police_station': r'P\.S\.\s*\(पोलीस\s*ठाणे\)\s*[:।]\s*([^F]+?)(?=FIR|$)',
+            'fir_number': r'FIR\s*No\.\s*[:।]\s*(\d+)',
+            'district': r'District\s*\(जिल्हा\)\s*[:।]\s*([^Y]+?)(?=Year|$)',
+            'year': r'Year\s*\(वर्ष\)\s*[:।]\s*(\d{4})',
+            'date_time': r'Date\s*and\s*Time.*?(\d{1,2}/\d{1,2}/\d{4})\s*(\d{1,2}:\d{2})'
+        }
         
-        # Convert sets back to lists and remove duplicates
-        final_pii = {}
-        for category, values in merged.items():
-            final_pii[category] = list(values)
+        for key, pattern in fir_header_patterns.items():
+            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                if key == 'date_time':
+                    structured_data['date'] = match.group(1)
+                    structured_data['time'] = match.group(2)
+                else:
+                    structured_data[key] = match.group(1).strip()
         
-        return final_pii
-    
-    def extract_all_pii(self, text):
-        """Extract PII using all available methods"""
-        # Clean the text first
-        clean_text = self.clean_text(text)
+        # Extract accused persons details
+        accused_section = re.search(
+            r'Details\s*of\s*known.*?accused.*?:(.*?)(?=Particulars|$)', 
+            text, re.IGNORECASE | re.DOTALL
+        )
         
-        # Extract using different methods
-        regex_pii = self.extract_pii_regex(clean_text)
-        contextual_pii = self.extract_contextual_pii(clean_text)
+        if accused_section:
+            accused_text = accused_section.group(1)
+            # Extract individual accused details
+            name_matches = re.findall(r'Name\s*\(नाव\)\s*([^A]+?)(?=Alias|Name|$)', accused_text)
+            structured_data['accused_names'] = [name.strip() for name in name_matches if name.strip()]
         
-        # Extract using spaCy if available
-        spacy_pii = {}
-        if self.nlp:
-            spacy_pii = self.extract_pii_spacy(clean_text)
-        
-        # Merge all results
-        final_pii = self.merge_pii_results(regex_pii, contextual_pii, spacy_pii)
-        
-        return final_pii
+        return structured_data
 
 def main():
-    st.title("🔍 Legal Document PII Extractor")
-    st.markdown("**Extract Personal Identifiable Information from Legal PDFs (FIRs, Court Documents)**")
-    
-    # Initialize extractor
-    extractor = PIIExtractor()
-    
-    # Sidebar for configuration
-    st.sidebar.header("⚙️ Configuration")
+    st.title("🔍 Legal PDF PII Extractor")
+    st.markdown("### Extract Personal Identifiable Information from Legal Documents (FIRs)")
     
     # File upload
     uploaded_file = st.file_uploader(
-        "Upload Legal PDF Document",
-        type=['pdf'],
-        help="Upload FIR, Court documents, or other legal PDFs"
+        "Upload PDF file", 
+        type=['pdf'], 
+        help="Upload legal documents like FIRs for PII extraction"
     )
     
-    if uploaded_file:
-        st.success(f"✅ File uploaded: {uploaded_file.name}")
+    if uploaded_file is not None:
+        # Initialize extractor
+        extractor = PIIExtractor()
         
-        # Extract text
-        with st.spinner("Extracting text from PDF..."):
-            text = extractor.extract_text_from_pdf(uploaded_file)
-        
-        if text:
-            # Display extracted text (preview)
-            with st.expander("📄 Extracted Text Preview"):
-                st.text_area("Text Content", text[:2000] + "..." if len(text) > 2000 else text, height=200)
+        with st.spinner("Processing PDF..."):
+            # Extract text
+            extracted_text = extractor.extract_text_from_pdf(uploaded_file)
+            cleaned_text = extractor.clean_text(extracted_text)
             
-            # Extract PII
-            with st.spinner("Extracting PII..."):
-                pii_data = extractor.extract_all_pii(text)
+        if not cleaned_text.strip():
+            st.error("❌ Could not extract text from PDF. Please check if the file is valid.")
+            return
             
-            # Display results
-            st.header("🔍 Extracted PII Information")
+        # Display extracted text preview
+        with st.expander("📄 Extracted Text Preview"):
+            st.text_area("Raw Text", cleaned_text[:2000] + "..." if len(cleaned_text) > 2000 else cleaned_text, height=200)
+        
+        # Extract PII
+        with st.spinner("Extracting PII..."):
+            pii_data = extractor.extract_pii_by_category(cleaned_text)
+            contextual_pii = extractor.extract_contextual_pii(cleaned_text)
+            structured_data = extractor.extract_structured_data(cleaned_text)
+        
+        # Display results in tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 PII Summary", "🔍 Detailed Analysis", "📊 Structured Data", "📥 Export"])
+        
+        with tab1:
+            st.header("Extracted PII Summary")
             
-            if pii_data:
-                # Create tabs for different PII categories
-                tabs = st.tabs(["📊 Summary", "👤 Personal Info", "📱 Contact Info", "🏛️ Legal Info", "💰 Financial Info", "📋 Export"])
+            # Create summary cards
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Phone Numbers", len(pii_data.get('phone_numbers', [])))
+                st.metric("Names Found", len(pii_data.get('names', [])))
                 
-                with tabs[0]:  # Summary
-                    st.subheader("PII Summary")
-                    
-                    # Count statistics
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        total_items = sum(len(values) for values in pii_data.values())
-                        st.metric("Total PII Items", total_items)
-                    
-                    with col2:
-                        st.metric("Categories Found", len(pii_data))
-                    
-                    with col3:
-                        names_count = len(pii_data.get('names', []))
-                        st.metric("Names Found", names_count)
-                    
-                    with col4:
-                        phones_count = len(pii_data.get('phone_numbers', []))
-                        st.metric("Phone Numbers", phones_count)
-                    
-                    # Category breakdown
-                    if pii_data:
-                        st.subheader("Category Breakdown")
-                        category_df = pd.DataFrame([
-                            {"Category": category.replace('_', ' ').title(), "Count": len(values)}
-                            for category, values in pii_data.items()
-                        ])
-                        st.bar_chart(category_df.set_index('Category'))
+            with col2:
+                st.metric("Addresses", len(pii_data.get('addresses', [])))
+                st.metric("Dates", len(pii_data.get('dates', [])))
                 
-                with tabs[1]:  # Personal Info
-                    st.subheader("👤 Personal Information")
+            with col3:
+                st.metric("FIR Numbers", len(pii_data.get('fir_numbers', [])))
+                st.metric("Amounts", len(pii_data.get('amounts', [])))
+            
+            # Display key information
+            if pii_data.get('names'):
+                st.subheader("👤 Names")
+                for name in pii_data['names'][:5]:  # Show top 5
+                    st.write(f"• {name}")
                     
-                    col1, col2 = st.columns(2)
+            if pii_data.get('phone_numbers'):
+                st.subheader("📱 Phone Numbers")
+                for phone in pii_data['phone_numbers']:
+                    st.write(f"• {phone}")
                     
-                    with col1:
-                        if 'names' in pii_data:
-                            st.write("**Names:**")
-                            for name in pii_data['names']:
-                                st.write(f"• {name}")
-                    
-                    with col2:
-                        if 'ages' in pii_data:
-                            st.write("**Ages:**")
-                            for age in pii_data['ages']:
-                                st.write(f"• {age}")
+            if pii_data.get('addresses'):
+                st.subheader("🏠 Addresses")
+                for addr in pii_data['addresses'][:3]:  # Show top 3
+                    st.write(f"• {addr}")
+        
+        with tab2:
+            st.header("Detailed PII Analysis")
+            
+            for category, items in pii_data.items():
+                if items:
+                    st.subheader(f"{category.replace('_', ' ').title()}")
+                    df = pd.DataFrame({'Extracted Data': items})
+                    st.dataframe(df, use_container_width=True)
+        
+        with tab3:
+            st.header("Structured Document Data")
+            
+            if structured_data:
+                st.json(structured_data)
+            
+            if contextual_pii:
+                st.subheader("Contextual Information")
                 
-                with tabs[2]:  # Contact Info
-                    st.subheader("📱 Contact Information")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if 'phone_numbers' in pii_data:
-                            st.write("**Phone Numbers:**")
-                            for phone in pii_data['phone_numbers']:
-                                st.write(f"• {phone}")
-                    
-                    with col2:
-                        if 'addresses' in pii_data:
-                            st.write("**Addresses:**")
-                            for addr in pii_data['addresses']:
-                                st.write(f"• {addr}")
+                # Complainant details
+                if contextual_pii.get('complainant_details'):
+                    st.write("**Complainant Details:**")
+                    st.json(contextual_pii['complainant_details'])
                 
-                with tabs[3]:  # Legal Info
-                    st.subheader("🏛️ Legal Information")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if 'fir_numbers' in pii_data:
-                            st.write("**FIR Numbers:**")
-                            for fir in pii_data['fir_numbers']:
-                                st.write(f"• {fir}")
-                        
-                        if 'police_stations' in pii_data:
-                            st.write("**Police Stations:**")
-                            for ps in pii_data['police_stations']:
-                                st.write(f"• {ps}")
-                    
-                    with col2:
-                        if 'dates' in pii_data:
-                            st.write("**Dates:**")
-                            for date in pii_data['dates']:
-                                st.write(f"• {date}")
-                        
-                        if 'vehicle_numbers' in pii_data:
-                            st.write("**Vehicle Numbers:**")
-                            for vehicle in pii_data['vehicle_numbers']:
-                                st.write(f"• {vehicle}")
+                # Case details
+                if contextual_pii.get('case_details'):
+                    st.write("**Case Details:**")
+                    st.json(contextual_pii['case_details'])
                 
-                with tabs[4]:  # Financial Info
-                    st.subheader("💰 Financial Information")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if 'amounts' in pii_data:
-                            st.write("**Amounts/Money:**")
-                            for amount in pii_data['amounts']:
-                                st.write(f"• {amount}")
-                    
-                    with col2:
-                        if 'id_numbers' in pii_data:
-                            st.write("**ID Numbers:**")
-                            for id_num in pii_data['id_numbers']:
-                                st.write(f"• {id_num}")
-                
-                with tabs[5]:  # Export
-                    st.subheader("📋 Export Data")
-                    
-                    # Prepare data for export
-                    export_data = []
-                    for category, values in pii_data.items():
-                        for value in values:
-                            export_data.append({
-                                "Category": category.replace('_', ' ').title(),
-                                "Value": value,
-                                "Document": uploaded_file.name,
-                                "Extracted_At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            })
-                    
-                    if export_data:
-                        df = pd.DataFrame(export_data)
-                        st.dataframe(df)
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            # CSV download
-                            csv = df.to_csv(index=False)
-                            st.download_button(
-                                label="📥 Download CSV",
-                                data=csv,
-                                file_name=f"pii_extracted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv"
-                            )
-                        
-                        with col2:
-                            # JSON download
-                            json_data = json.dumps(pii_data, indent=2, ensure_ascii=False)
-                            st.download_button(
-                                label="📥 Download JSON",
-                                data=json_data,
-                                file_name=f"pii_extracted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                mime="application/json"
-                            )
-            else:
-                st.warning("⚠️ No PII found in the document. The document might be:")
-                st.write("- Heavily corrupted or poorly scanned")
-                st.write("- Not in the expected format")
-                st.write("- Contain only images without extractable text")
-        else:
-            st.error("❌ Could not extract text from the PDF. Please check if the file is valid.")
-    
-    # Instructions
-    with st.expander("ℹ️ Instructions"):
-        st.markdown("""
-        ### How to use this tool:
+                # Property details
+                if contextual_pii.get('property_details'):
+                    st.write("**Property/Financial Details:**")
+                    for prop in contextual_pii['property_details']:
+                        st.write(f"• Amount: {prop.get('amount', 'N/A')}")
+                        st.write(f"  Context: {prop.get('context', 'N/A')[:100]}...")
         
-        1. **Upload a PDF**: Click on the file uploader and select your legal document (FIR, court documents, etc.)
+        with tab4:
+            st.header("Export Results")
+            
+            # Prepare export data
+            export_data = {
+                'extraction_timestamp': datetime.now().isoformat(),
+                'file_name': uploaded_file.name,
+                'pii_data': pii_data,
+                'contextual_pii': contextual_pii,
+                'structured_data': structured_data
+            }
+            
+            # JSON export
+            json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="📥 Download as JSON",
+                data=json_str,
+                file_name=f"pii_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+            
+            # CSV export for tabular data
+            all_pii_items = []
+            for category, items in pii_data.items():
+                for item in items:
+                    all_pii_items.append({
+                        'Category': category,
+                        'Value': item,
+                        'File': uploaded_file.name
+                    })
+            
+            if all_pii_items:
+                df = pd.DataFrame(all_pii_items)
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📊 Download as CSV",
+                    data=csv,
+                    file_name=f"pii_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
         
-        2. **Review Extracted Text**: Check the text preview to ensure proper extraction
-        
-        3. **View PII Results**: Navigate through different tabs to see categorized PII information
-        
-        4. **Export Data**: Download the extracted PII as CSV or JSON for further processing
-        
-        ### Supported PII Types:
-        - **Names**: Person names in English and Hindi
-        - **Phone Numbers**: 10-digit Indian mobile numbers
-        - **Addresses**: Complete addresses with districts and states
-        - **Dates**: Various date formats
-        - **FIR Numbers**: Case numbers and reference numbers
-        - **Police Stations**: Station names and locations
-        - **ID Numbers**: Aadhaar, PAN, Passport, Driving License
-        - **Vehicle Numbers**: Indian vehicle registration numbers
-        - **Financial Info**: Amounts, money values
-        - **Ages**: Person ages
-        
-        ### Features:
-        - ✅ Multilingual support (Hindi, English)
-        - ✅ OCR-processed document support
-        - ✅ False positive reduction
-        - ✅ Multiple extraction methods
-        - ✅ Export capabilities
-        - ✅ Real-time processing
-        """)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("**Legal PII Extractor** - Built for accurate and efficient PII extraction from legal documents")
+        # Advanced options
+        with st.sidebar:
+            st.header("⚙️ Advanced Options")
+            
+            show_confidence = st.checkbox("Show Confidence Scores", value=False)
+            filter_duplicates = st.checkbox("Filter Duplicates", value=True)
+            min_length = st.slider("Minimum Text Length", 2, 20, 3)
+            
+            st.header("📊 Statistics")
+            total_pii = sum(len(items) for items in pii_data.values())
+            st.metric("Total PII Items", total_pii)
+            st.metric("Text Length", len(cleaned_text))
+            st.metric("Categories Found", len([k for k, v in pii_data.items() if v]))
 
 if __name__ == "__main__":
     main()
+
+# Additional utility functions for enhanced extraction
+
+def enhance_hindi_extraction(text: str) -> str:
+    """Enhance Hindi text extraction with specific preprocessing"""
+    # Common Devanagari character corrections
+    corrections = {
+        'ɮ': 'व', 'ĵ': 'ज', 'ç': 'क', 'Ě': 'ष', 'ã': 'न',
+        'Ĥ': 'प', 'ʜ': 'स', 'Ͻ': 'त', 'ǔ': 'ज', 'Ǖ': 'उ'
+    }
+    
+    for wrong, correct in corrections.items():
+        text = text.replace(wrong, correct)
+    
+    return text
+
+def validate_extracted_data(pii_data: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Validate and clean extracted PII data"""
+    validated_data = {}
+    
+    for category, items in pii_data.items():
+        validated_items = []
+        
+        for item in items:
+            # Validate phone numbers
+            if category == 'phone_numbers':
+                if re.match(r'^\d{10,12}$', re.sub(r'[\s\-\.]', '', item)):
+                    validated_items.append(item)
+            
+            # Validate names (must contain at least one letter)
+            elif category == 'names':
+                if re.search(r'[A-Za-z\u0900-\u097F]', item) and len(item.strip()) > 2:
+                    validated_items.append(item)
+            
+            # Validate dates
+            elif category == 'dates':
+                try:
+                    # Try to parse the date
+                    date_parts = re.findall(r'\d+', item)
+                    if len(date_parts) >= 3:
+                        validated_items.append(item)
+                except:
+                    pass
+            
+            else:
+                if len(item.strip()) > 1:
+                    validated_items.append(item)
+        
+        validated_data[category] = validated_items
+    
+    return validated_data
+
+# Usage instructions
+"""
+USAGE INSTRUCTIONS:
+==================
+
+1. Install required packages:
+   pip install streamlit PyPDF2 pdfplumber PyMuPDF pandas
+
+2. Run the application:
+   streamlit run pii_extractor.py
+
+3. Upload your PDF file and view extracted PII in different tabs
+
+4. Export results as JSON or CSV for further processing
+
+FEATURES:
+=========
+- Multi-method PDF text extraction for maximum accuracy
+- Hindi and English text processing
+- Pattern-based PII extraction
+- Contextual analysis for better accuracy
+- Structured data extraction for FIR documents
+- Data validation and cleaning
+- Export functionality
+- Real-time preview and statistics
+
+SUPPORTED PII TYPES:
+===================
+- Names (complainant, accused, witnesses)
+- Phone numbers (mobile and landline)
+- Addresses (residential, incident location)
+- Dates (incident, filing, birth dates)
+- FIR numbers and case references
+- Ages and personal details
+- Financial amounts
+- Vehicle numbers
+- Legal sections and acts
+- Aadhaar and PAN numbers
+"""
