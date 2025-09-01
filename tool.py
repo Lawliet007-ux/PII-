@@ -462,12 +462,11 @@ if st.button("Extract PII"):
                 tmp.write(uploaded.read())
                 tmp_path = tmp.name
             extracted_text = extract_text_from_pdf(tmp_path)
-            # Temporarily toggle NER if user disabled
-            global NER_PIPE
-            if not use_ner:
-                NER_PIPE = None
-            pii = extract_pii(extracted_text)
+
+            # Pass text to extractor with or without NER
+            pii = extract_pii(extracted_text if use_ner else re.sub(r".*", "", extracted_text))
             results[uploaded.name] = pii
+
             try:
                 os.remove(tmp_path)
             except Exception:
@@ -475,9 +474,7 @@ if st.button("Extract PII"):
 
     # Process pasted text
     if raw_text.strip():
-        if not use_ner:
-            NER_PIPE = None
-        pii = extract_pii(raw_text)
+        pii = extract_pii(raw_text if use_ner else re.sub(r".*", "", raw_text))
         results["pasted_text"] = pii
 
     if results:
@@ -488,5 +485,3 @@ if st.button("Extract PII"):
         st.markdown(f"[Download JSON]({href})")
     else:
         st.warning("Please upload at least one PDF or paste text.")
-
-st.info("Tip: For best accuracy on scanned FIRs, install Hindi Tesseract data and consider commercial OCR. Swap the HuggingFace model in load_ner() with your fine-tuned FIR NER for exceptional results.")
