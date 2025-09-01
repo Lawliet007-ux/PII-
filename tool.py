@@ -1,29 +1,3 @@
-"""
-Streamlit app: FIR PII extractor (Hindi + English)
-Saves extracted PII as JSON and shows raw text.
-
-How it works (high level):
-1. Try to extract selectable text using PyMuPDF (fitz) and pdfplumber.
-2. If text is missing or insufficient, render each page to an image and run Tesseract OCR (eng+hin).
-3. Detect language per block and run rule-based regex extraction for the requested PII fields.
-4. Optional: plug in a token classification (NER) model from HuggingFace for improved name/address detection.
-
-Features:
-- Upload single or multiple PDF files
-- View raw text per page and combined
-- Show extracted PII in a table and JSON
-- Download JSON results
-
-Dependencies:
-- pip install streamlit pymupdf pdfplumber pytesseract pillow opencv-python regex langdetect transformers torch
-- System: tesseract-ocr installed + Devanagari (hin) traineddata (for example on Ubuntu: apt-get install tesseract-ocr tesseract-ocr-hin)
-
-Note: This app is designed to be a high-quality, pragmatic starting point. For best production accuracy we recommend
-- fine-tuning a multilingual token-classification model (XLM-R / IndicBERT) on annotated FIRs
-- using commercial OCR (Google Vision / AWS Textract) for noisy scans
-
-"""
-
 import streamlit as st
 import fitz  # PyMuPDF
 import pdfplumber
