@@ -1,9 +1,10 @@
 streamlit 
-PyPDF2 
-pdfplumber 
 pymupdf 
-pandas 
-pillow 
+pdfplumber 
 pytesseract 
-opencv-python-headless 
-numpy
+pillow 
+opencv-python 
+langdetect 
+regex 
+transformers 
+torch
