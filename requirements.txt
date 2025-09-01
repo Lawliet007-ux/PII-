@@ -3,6 +3,8 @@ pymupdf
 pdfplumber 
 pytesseract 
 pillow 
-rapidfuzz 
+opencv-python 
+regex 
 transformers 
-torch
+torch 
+rapidfuzz
