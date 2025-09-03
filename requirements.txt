@@ -1,9 +1,8 @@
 streamlit
-PyMuPDF
+PyPDF2
 pdfplumber
-pytesseract
-Pillow
+PyMuPDF
+pandas
 regex
-rapidfuzz
-transformers
-torch
+spacy
+nltk
