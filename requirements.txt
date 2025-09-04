@@ -7,4 +7,3 @@ easyocr
 rapidfuzz
 dateparser
 json5
-poppler
