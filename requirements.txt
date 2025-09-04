@@ -3,9 +3,8 @@ PyMuPDF
 pdf2image
 numpy
 pillow
-paddleocr
-layoutparser
+easyocr
+layoutparser[ocr]
 transformers
 torch
 sentencepiece
-opencv-python
