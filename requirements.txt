@@ -1,8 +1,10 @@
 streamlit
-PyPDF2
-pdfplumber
 PyMuPDF
-pandas
-regex
-spacy
-nltk
+pdf2image
+opencv-python-headless
+numpy
+paddleocr
+layoutparser[ocr]
+transformers
+torch
+sentencepiece
