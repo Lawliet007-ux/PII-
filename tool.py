@@ -779,7 +779,7 @@ class AdvancedFIRExtractor:
         if results.get('police_station'):
             ps_name = results['police_station'].strip()
             # Remove common suffixes that might be included
-            ps_name = re.sub(r'\s+(police\s+station|p\.?s\.?|thana), '', ps_name, flags=re.IGNORECASE)
+            ps_name = re.sub(r'\s+(police\s+station|p\.?s\.?|thana)\b', '', ps_name, flags=re.IGNORECASE)
             if len(ps_name) > 1:
                 results['police_station'] = ps_name
             else:
