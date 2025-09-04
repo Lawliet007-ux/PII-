@@ -79,30 +79,32 @@ reader = load_resources()
 # ---------------------------
 def ocr_pdf_pages(pdf_bytes: bytes, dpi: int = 300) -> List[List[Dict[str, Any]]]:
     """
-    Returns list-of-pages where each page is list of dicts: {"text":..., "bbox":(x1,y1,x2,y2), "y":center_y}
-    Uses EasyOCR detail mode for bbox.
+    Returns list-of-pages where each page is list of dicts: {"text":..., "bbox":..., "y":...}
+    Uses EasyOCR for OCR, and PyMuPDF for rendering instead of pdf2image (no Poppler needed).
     """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_results = []
-    images = convert_from_bytes(pdf_bytes, dpi=dpi)
-    for img in images:
+    for page in doc:
+        # Render page to image
+        zoom = dpi / 72  # scale factor
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         img = enhance_image_for_ocr(img)
         arr = np.array(img)
         raw = reader.readtext(arr, detail=1, paragraph=False)  # list of [bbox, text, conf]
-        # Convert to list of dicts
+
         lines = []
         for bbox, text, conf in raw:
-            # bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] -> compute center y
             ys = [p[1] for p in bbox]
-            center_y = sum(ys) / len(ys)
-            # flatten bbox to tuple
             x_vals = [p[0] for p in bbox]
-            y_vals = ys
-            bbox_flat = (min(x_vals), min(y_vals), max(x_vals), max(y_vals))
+            bbox_flat = (min(x_vals), min(ys), max(x_vals), max(ys))
+            center_y = sum(ys) / len(ys)
             lines.append({"text": text.strip(), "bbox": bbox_flat, "y": center_y, "conf": conf})
-        # sort top->bottom
         lines = sorted(lines, key=lambda r: r["y"])
         pages_results.append(lines)
     return pages_results
+
 
 # ---------------------------
 # Helper: join lines into paragraphs by vertical distance
