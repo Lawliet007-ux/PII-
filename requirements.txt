@@ -1,16 +1,11 @@
-streamlit
-pdfplumber
-pandas
-regex   # re is stdlib, but sometimes regex is needed for advanced patterns
-spacy
-torch
-transformers
-PyMuPDF
-Pillow
-pytesseract
-pdf2image
-numpy
-langdetect
-easyocr
-requests
-beautifulsoup4
+streamlit 
+pdfplumber 
+pymupdf 
+pdf2image 
+pillow 
+pytesseract 
+transformers 
+torch 
+phonenumbers 
+langdetect 
+sentencepiece
