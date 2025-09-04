@@ -161,11 +161,12 @@ def main():
     st.title("📄 FIR PII Extraction Tool")
     st.markdown("Extract Personal Identifiable Information from FIR documents in multiple Indian languages")
     
-    # Sidebar for file upload and settings
+    # Main file upload area - more prominent
+    st.header("Upload FIR Document")
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", label_visibility="collapsed")
+    
+    # Sidebar for settings only
     with st.sidebar:
-        st.header("Upload FIR Document")
-        uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-        
         st.header("Settings")
         extraction_method = st.radio(
             "Extraction Method",
