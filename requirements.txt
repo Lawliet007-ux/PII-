@@ -1,10 +1,7 @@
 streamlit
 PyMuPDF
-pdf2image
-numpy
 pillow
+numpy
 easyocr
 rapidfuzz
 dateparser
-json5
-poppler-utils
