@@ -4,7 +4,6 @@ from pdf2image import convert_from_bytes
 import easyocr
 from PIL import Image
 import numpy as np
-import layoutparser as lp
 from transformers import pipeline
 import json
 import re
@@ -56,42 +55,35 @@ def extract_text_from_pdf(uploaded_file):
     return "\n".join(extracted_text)
 
 # ---------------------------
-# LayoutParser: metadata block
-# ---------------------------
-def extract_metadata_block(text):
-    # In practice you’d use lp.Detectron2LayoutModel,
-    # but here fallback to first ~800 chars (metadata zone).
-    return text[:800]
-
-# ---------------------------
 # JSON repair helper
 # ---------------------------
 def clean_and_parse_json(raw_text: str):
+    # Try to find JSON object
     match = re.search(r"\{.*\}", raw_text, re.DOTALL)
     candidate = match.group(0) if match else raw_text
 
-    # Basic cleanup
-    candidate = candidate.replace("):", ":")
-    candidate = candidate.replace("(cid:", "")
+    # Cleanup common OCR junk
+    candidate = candidate.replace("):", ":").replace("(cid:", "")
     candidate = re.sub(r"\)\s*", "", candidate)
 
+    # Attempt JSON parsing
     try:
         return json.loads(candidate)
     except Exception:
         try:
             return json5.loads(candidate)
         except Exception:
-            return {"error": "Could not parse JSON", "raw": raw_text}
+            return {"raw_text": raw_text}
 
 # ---------------------------
 # Normalize fields with LLM
 # ---------------------------
 def extract_pii_fields(text):
-    instruction = """Extract FIR metadata into strict JSON with these fields:
+    instruction = """Extract FIR metadata into a STRICT JSON object with these fields:
     fir_no, year, state_name, dist_name, police_station,
     under_acts, under_sections, revised_case_category,
     oparty, name, address, phone, jurisdiction, jurisdiction_type.
-    Ensure valid JSON format ONLY, no extra commentary."""
+    Respond with ONLY a valid JSON object. No explanation, no commentary."""
 
     input_text = f"{instruction}\n\nFIR TEXT:\n{text}"
     output = normalizer(input_text, max_length=512)[0]["generated_text"]
@@ -112,16 +104,22 @@ if uploaded_file:
     st.text_area("Raw Text", text, height=300)
 
     with st.spinner("Extracting PII fields..."):
-        meta_block = extract_metadata_block(text)
+        meta_block = text[:1000]  # metadata region
         pii_json = extract_pii_fields(meta_block)
 
     st.subheader("🧾 Extracted PII (Editable)")
     edited = {}
     if isinstance(pii_json, dict):
-        for key, value in pii_json.items():
+        for key in [
+            "fir_no", "year", "state_name", "dist_name", "police_station",
+            "under_acts", "under_sections", "revised_case_category",
+            "oparty", "name", "address", "phone", "jurisdiction", "jurisdiction_type"
+        ]:
+            value = pii_json.get(key, "")
             if isinstance(value, list):
-                edited[key] = st.text_area(f"{key}", "\n".join(map(str, value)))
-                edited[key] = [v.strip() for v in edited[key].split("\n") if v.strip()]
+                val_str = "\n".join(map(str, value))
+                edited_val = st.text_area(f"{key}", val_str)
+                edited[key] = [v.strip() for v in edited_val.split("\n") if v.strip()]
             else:
                 edited[key] = st.text_input(f"{key}", str(value))
     else:
