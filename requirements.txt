@@ -4,8 +4,8 @@ pdf2image
 numpy
 pillow
 easyocr
-layoutparser[ocr]
 transformers
 torch
 sentencepiece
+rapidfuzz
 json5
