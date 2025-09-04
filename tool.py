@@ -1,490 +1,709 @@
-# app.py
-"""
-Final robust FIR PII extractor - FIXED
-- PyMuPDF for text + rendering (no Poppler)
-- EasyOCR for OCR fallback (en + hi)
-- Deterministic extractors returning (value, confidence, evidence)
-- Streamlit UI: raw text, editable fields, evidence, download JSON
-"""
-
 import streamlit as st
-import fitz  # PyMuPDF
-from PIL import Image, ImageEnhance
-import numpy as np
-import easyocr
-import re
+import pandas as pd
 import json
-import dateparser
-from rapidfuzz import fuzz
-from typing import List, Dict, Any, Tuple
+from datetime import datetime
+import tempfile
+import os
+from typing import Dict, List, Any, Optional
+import warnings
+warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="FIR PII Extractor — Final (Fixed)")
+# Core libraries for PDF processing and NLP
+try:
+    import fitz  # PyMuPDF for PDF text extraction
+    import pytesseract
+    from PIL import Image
+    import cv2
+    import numpy as np
+    
+    # Advanced NLP libraries
+    import spacy
+    from transformers import (
+        AutoTokenizer, AutoModelForTokenClassification,
+        AutoModelForSequenceClassification, pipeline,
+        BertTokenizer, BertForTokenClassification
+    )
+    import torch
+    from sentence_transformers import SentenceTransformer
+    import google.generativeai as genai
+    from langdetect import detect, LangDetectError
+    
+    # Additional utilities
+    import re
+    from collections import defaultdict
+    import unicodedata
+    
+except ImportError as e:
+    st.error(f"Missing required library: {e}. Please install all dependencies.")
 
-# ---------------------------
-# Simple gazetteer (expandable)
-# ---------------------------
-STATE_GAZ = [
-    "Maharashtra", "महाराष्ट्र", "Chhattisgarh", "छत्तीसगढ़",
-    "Uttar Pradesh", "उत्तर प्रदेश", "Madhya Pradesh", "मध्य प्रदेश",
-    "Delhi", "दिल्ली", "West Bengal", "पश्चिम बंगाल", "Karnataka", "कर्नाटक"
-]
-
-# label variants (English + Hindi small set)
-LABELS = {
-    "fir": ["fir", "f.i.r", "fir no", "fir number", "fir नं"],
-    "date": ["date", "date of fir", "दिनांक", "तारीख"],
-    "time": ["time", "वेळ", "समय", "Time of FIR"],
-    "ps": ["police station", "p.s.", "ps", "पोलीस ठाणे", "थाना"],
-    "district": ["district", "जिल्हा", "जिला"],
-    "state": ["state", "राज्य"],
-    "sections": ["section", "sections", "कलम"],
-    "acts": ["act", "acts", "धिननयम"],
-    "name": ["name", "नाव", "complainant", "informant", "accused", "आरोपी"],
-    "phone": ["phone", "मोबाइल", "मोबाईल", "फोन"],
-    "address": ["address", "पत्ता"]
-}
-
-# ---------------------------
-# Load heavy resources once
-# ---------------------------
-@st.cache_resource(show_spinner=False)
-def load_easyocr_reader():
-    # Creates easyocr.Reader (loads model files first run)
-    return easyocr.Reader(['en', 'hi'])  # CPU by default; if you have GPU adjust accordingly
-
-reader = load_easyocr_reader()
-
-# ---------------------------
-# Utility: render page -> PIL image
-# ---------------------------
-def render_page_to_image(page: fitz.Page, dpi: int = 200) -> Image.Image:
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    # small enhancements to help OCR
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-    img = ImageEnhance.Sharpness(img).enhance(1.05)
-    return img
-
-# ---------------------------
-# OCR with bboxes (EasyOCR detail=1)
-# ---------------------------
-def ocr_page_with_bboxes(page: fitz.Page, dpi: int = 200) -> List[Dict[str, Any]]:
-    img = render_page_to_image(page, dpi=dpi)
-    arr = np.array(img)
-    raw = reader.readtext(arr, detail=1, paragraph=False)  # list of (bbox, text, conf) or similar
-    lines = []
-    for item in raw:
-        # handle both tuple/list forms
-        if not item:
-            continue
-        if len(item) == 3:
-            bbox, text, conf = item
-        elif len(item) == 2:
-            bbox, text = item
-            conf = 1.0
-        else:
-            # unexpected format, skip
-            continue
-        # bbox -> flatten to (x0,y0,x1,y1)
+class AdvancedFIRExtractor:
+    def __init__(self):
+        """Initialize the FIR extractor with advanced NLP models."""
+        self.setup_models()
+        self.setup_indian_patterns()
+        
+    def setup_models(self):
+        """Initialize all NLP models and tools."""
         try:
-            xs = [pt[0] for pt in bbox]
-            ys = [pt[1] for pt in bbox]
-            bbox_flat = (min(xs), min(ys), max(xs), max(ys))
-            center_y = sum(ys) / len(ys)
-        except Exception:
-            bbox_flat = (0, 0, 0, 0)
-            center_y = 0
-        lines.append({
-            "text": str(text).strip(),
-            "bbox": bbox_flat,
-            "y": center_y,
-            "conf": float(conf) if conf is not None else 1.0
-        })
-    # sort top -> bottom
-    lines = sorted(lines, key=lambda r: r["y"])
-    return lines
-
-# ---------------------------
-# Get page lines: text layer if present else OCR
-# ---------------------------
-def build_pages_lines_from_pdf(pdf_bytes: bytes) -> Tuple[str, List[List[Dict[str, Any]]]]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_lines: List[List[Dict[str, Any]]] = []
-    all_texts = []
-    for page in doc:
-        text_layer = page.get_text("text") or ""
-        text_layer = " ".join(text_layer.split())
-        if text_layer and len(text_layer) > 25:
-            # convert text layer -> pseudo-lines using splitlines
-            lines = []
-            for i, l in enumerate(text_layer.splitlines()):
-                if l.strip():
-                    lines.append({"text": l.strip(), "bbox": (0, i*10, 1000, i*10+8), "y": i*10, "conf": 1.0})
-            pages_lines.append(lines)
-            all_texts.append(text_layer)
-        else:
-            # fallback to OCR with bboxes
+            # Load multilingual NER model
+            self.ner_tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+            self.ner_model = AutoModelForTokenClassification.from_pretrained(
+                "xlm-roberta-base", num_labels=9
+            )
+            
+            # Initialize spaCy for English and Hindi
             try:
-                lines = ocr_page_with_bboxes(page, dpi=250)
-            except Exception as e:
-                # if OCR fails, use an empty list
-                lines = []
-            pages_lines.append(lines)
-            page_text = " ".join([ln["text"] for ln in lines])
-            all_texts.append(page_text)
-    full_text = "\n\n".join(all_texts)
-    return full_text, pages_lines
-
-# ---------------------------
-# Small cleaning helper
-# ---------------------------
-def normalize_noise(s: str) -> str:
-    if not s:
-        return ""
-    s = re.sub(r"\(cid:\d+\)", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip(" \t\n\r:,.")
-    return s
-
-# ---------------------------
-# Fuzzy label search in a page's lines
-# ---------------------------
-def fuzzy_label_search(lines: List[Dict[str, Any]], variants: List[str], cutoff: int = 70) -> Tuple[int, str, float]:
-    if not lines:
-        return -1, "", 0.0
-    best_score = 0
-    best_idx = -1
-    best_text = ""
-    for i, ln in enumerate(lines):
-        t = ln["text"].lower()
-        for v in variants:
-            s = fuzz.partial_ratio(t, v.lower())
-            # direct substring => perfect
-            if v.lower() in t:
-                s = max(s, 100)
-            if s > best_score:
-                best_score = s
-                best_idx = i
-                best_text = ln["text"]
-    if best_score >= cutoff:
-        return best_idx, best_text, best_score / 100.0
-    return -1, "", 0.0
-
-# ---------------------------
-# Field extractors: always return (value, confidence, evidence)
-# ---------------------------
-def extract_fir_no(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, float, str]:
-    idx, txt, score = fuzzy_label_search(lines, LABELS["fir"], cutoff=45)
-    if idx >= 0:
-        ln = lines[idx]["text"]
-        m = re.search(r"(FIR|F\.I\.R|FIR No|FIR No\.|FIR नं)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)", ln, flags=re.I)
-        if m:
-            return normalize_noise(m.group(2)), 0.95, ln
-        # neighbors
-        for j in range(idx, min(len(lines), idx + 4)):
-            m2 = re.search(r"([A-Za-z0-9\-\/]{3,})", lines[j]["text"])
-            if m2:
-                return normalize_noise(m2.group(1)), 0.6, lines[j]["text"]
-    # global search
-    m = re.search(r"FIR\s*(No\.?|No|Number)?\s*[:\-]?\s*([A-Za-z0-9\-\/]{3,})", full_text, flags=re.I)
-    if m:
-        return normalize_noise(m.group(2)), 0.5, m.group(0)
-    return "", 0.0, ""
-
-def extract_date_time(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, str, float, str]:
-    # try to find dd/mm/yyyy or d-m-yyyy
-    m = re.search(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})", full_text)
-    if m:
-        parsed = dateparser.parse(m.group(1), settings={"DATE_ORDER":"DMY"})
-        if parsed:
-            d = parsed.strftime("%Y-%m-%d")
-            # try time
-            m2 = re.search(r"(\d{1,2}:\d{2})", full_text)
-            t = m2.group(1) if m2 else ""
-            return d, t, 0.95, m.group(0)
-    # label-based fallback
-    idx, txt, score = fuzzy_label_search(lines, LABELS["date"] + LABELS["time"], cutoff=40)
-    if idx >= 0:
-        ln = lines[idx]["text"]
-        m3 = re.search(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})", ln)
-        m4 = re.search(r"(\d{1,2}:\d{2})", ln)
-        d = dateparser.parse(m3.group(1), settings={"DATE_ORDER":"DMY"}).strftime("%Y-%m-%d") if m3 else ""
-        t = m4.group(1) if m4 else ""
-        return d, t, 0.75 if d else 0.4, ln
-    return "", "", 0.0, ""
-
-def extract_phone(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, float, str]:
-    m = re.search(r"(\+?\d[\d\-\s]{8,}\d)", full_text)
-    if m:
-        digits = re.sub(r"\D", "", m.group(1))
-        if len(digits) == 10:
-            return "+91" + digits, 0.95, m.group(0)
-        return digits, 0.6, m.group(0)
-    idx, txt, score = fuzzy_label_search(lines, LABELS["phone"], cutoff=40)
-    if idx >= 0:
-        m2 = re.search(r"(\+?\d[\d\-\s]{8,}\d)", lines[idx]["text"])
-        if m2:
-            digits = re.sub(r"\D", "", m2.group(1))
-            if len(digits) == 10:
-                return "+91" + digits, 0.9, lines[idx]["text"]
-            return digits, 0.6, lines[idx]["text"]
-    return "", 0.0, ""
-
-def extract_sections(lines: List[Dict[str, Any]], full_text: str) -> Tuple[List[str], float, str]:
-    idx, txt, score = fuzzy_label_search(lines, LABELS["sections"], cutoff=40)
-    found = []
-    ev = ""
-    conf = 0.0
-    if idx >= 0:
-        ev = lines[idx]["text"]
-        nums = re.findall(r"\b(\d{1,3})\b", lines[idx]["text"])
-        if nums:
-            found = list(dict.fromkeys(nums))
-            conf = 0.9
-        else:
-            # neighbors
-            for j in range(idx+1, min(len(lines), idx+4)):
-                nums2 = re.findall(r"\b(\d{1,3})\b", lines[j]["text"])
-                if nums2:
-                    found.extend(nums2)
-            found = list(dict.fromkeys(found))
-            conf = 0.7 if found else 0.3
-    else:
-        # global numbers fallback
-        nums = re.findall(r"\b(\d{1,3})\b", full_text)
-        cand = [n for n in nums if 1 <= int(n) <= 500]
-        found = list(dict.fromkeys(cand))
-        conf = 0.25 if found else 0.0
-        ev = "global-numeric"
-    return found, conf, ev
-
-def extract_police_station(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, float, str]:
-    idx, txt, score = fuzzy_label_search(lines, LABELS["ps"], cutoff=40)
-    if idx >= 0:
-        ln = lines[idx]["text"]
-        parts = re.split(r"[:\-]", ln, maxsplit=1)
-        if len(parts) > 1 and parts[1].strip():
-            return normalize_noise(parts[1]), 0.9, ln
-        if idx + 1 < len(lines):
-            return normalize_noise(lines[idx+1]["text"]), 0.6, lines[idx+1]["text"]
-        return normalize_noise(ln), 0.5, ln
-    # fallback search in full text for 'P.S.' token
-    m = re.search(r"\bP\.S\.\s*[:\-]?\s*([^\n,;]+)", full_text, flags=re.I)
-    if m:
-        return normalize_noise(m.group(1)), 0.7, m.group(0)
-    return "", 0.0, ""
-
-def extract_state_district(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, str, float, str]:
-    # try "District" label first
-    combined = " ".join([ln["text"] for ln in lines])
-    m = re.search(r"District\s*[:\-]?\s*([A-Za-z\u0900-\u097F0-9,\- ]+)", combined, flags=re.I)
-    dist = ""; state = ""; ev = ""
-    if m:
-        chunk = m.group(1)
-        ev = m.group(0)
-        parts = [p.strip() for p in re.split(r",|\(|\)|–|-", chunk) if p.strip()]
-        if parts:
-            dist = parts[0]
-            if len(parts) > 1:
-                state = parts[-1]
-    # fuzzy-match state from full_text
-    if not state:
-        best_s = None; best_score = 0
-        for s in STATE_GAZ:
-            sc = fuzz.WRatio(full_text.lower(), s.lower())
-            if sc > best_score:
-                best_score = sc; best_s = s
-        if best_score > 60:
-            state = best_s; ev = "global-state-match"
-    conf = 0.6 if (dist or state) else 0.0
-    return normalize_noise(dist), normalize_noise(state), conf, ev
-
-def extract_names(lines: List[Dict[str, Any]], full_text: str) -> Tuple[List[str], float, str]:
-    names = []
-    ev = ""
-    idx, txt, score = fuzzy_label_search(lines, LABELS["name"], cutoff=35)
-    if idx >= 0:
-        ln = lines[idx]["text"]
-        parts = re.split(r"[:\-]\s*", ln, maxsplit=1)
-        if len(parts) > 1 and parts[1].strip():
-            names.append(parts[1].strip()); ev = ln
-    # also scan for honorifics or capitalized words (simple heuristic)
-    for ln in lines[:30]:
-        t = ln["text"].strip()
-        if re.search(r"\b(Shri|Shri\.|Smt|Mr\.|Mrs\.)\b", t, flags=re.I):
-            # extract name-like part after honorific
-            m = re.search(r"(Shri\.?|Shri|Smt|Mr\.|Mrs\.)\s*([A-Za-z\u0900-\u097F\s\.]{3,})", t)
-            if m:
-                cand = m.group(2).strip()
-                if cand and cand not in names:
-                    names.append(cand)
-    if names:
-        return [normalize_noise(n) for n in names], 0.6, ev or "heuristic"
-    return [], 0.0, ""
-
-def extract_address(lines: List[Dict[str, Any]], full_text: str) -> Tuple[str, float, str]:
-    idx, txt, score = fuzzy_label_search(lines, LABELS["address"], cutoff=40)
-    if idx >= 0:
-        # take this line + next two for multi-line addresses
-        addr = lines[idx]["text"]
-        for j in range(idx+1, min(idx+3, len(lines))):
-            addr += " " + lines[j]["text"]
-        return normalize_noise(addr), 0.6, lines[idx]["text"]
-    # fallback: look for "Address" in full_text
-    m = re.search(r"(Address|पत्ता)\s*[:\-]?\s*([^\n]{10,200})", full_text, flags=re.I)
-    if m:
-        return normalize_noise(m.group(2)), 0.5, m.group(0)
-    return "", 0.0, ""
-
-# ---------------------------
-# Main orchestrator
-# ---------------------------
-def extract_from_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
-    try:
-        full_text, pages_lines = build_pages_lines_from_pdf(pdf_bytes)
-    except Exception as exc:
-        raise RuntimeError(f"Unable to process PDF: {exc}")
-
-    # choose best page for metadata: highest label matches
-    best_idx = 0; best_score = -1
-    label_variants = [v for vals in LABELS.values() for v in vals]
-    for i, pl in enumerate(pages_lines):
-        tally = 0
-        lower = " ".join([ln["text"].lower() for ln in pl])
-        for v in label_variants:
-            if v.lower() in lower:
-                tally += 1
-        if tally > best_score:
-            best_score = tally; best_idx = i
-    page_lines = pages_lines[best_idx] if pages_lines else []
-
-    # extract fields
-    fir_val, fir_conf, fir_ev = extract_fir_no(page_lines, full_text)
-    date_val, time_val, dt_conf, dt_ev = extract_date_time(page_lines, full_text)
-    phone_val, phone_conf, phone_ev = extract_phone(page_lines, full_text)
-    sections_val, sec_conf, sec_ev = extract_sections(page_lines, full_text)
-    ps_val, ps_conf, ps_ev = extract_police_station(page_lines, full_text)
-    dist_val, state_val, sd_conf, sd_ev = extract_state_district(page_lines, full_text)
-    names_val, names_conf, names_ev = extract_names(page_lines, full_text)
-    addr_val, addr_conf, addr_ev = extract_address(page_lines, full_text)
-
-    result = {
-        "fir_no": fir_val,
-        "date": date_val,
-        "time": time_val,
-        "phone": phone_val,
-        "police_station": ps_val,
-        "dist_name": dist_val,
-        "state_name": state_val,
-        "under_sections": sections_val,
-        "under_acts": [],  # acts extraction left empty (could be added like sections)
-        "names": names_val,
-        "address": addr_val,
-        "_meta": {"best_metadata_page": best_idx},
-        "_evidence": {
-            "fir_no": fir_ev, "date": dt_ev, "time": dt_ev, "phone": phone_ev,
-            "police_station": ps_ev, "state_district": sd_ev, "sections": sec_ev,
-            "names": names_ev, "address": addr_ev
-        },
-        "_confidence": {
-            "fir_no": round(float(fir_conf), 2),
-            "date": round(float(dt_conf), 2),
-            "time": round(float(0.8 if time_val else 0.0), 2),
-            "phone": round(float(phone_conf), 2),
-            "police_station": round(float(ps_conf), 2),
-            "state_district": round(float(sd_conf), 2),
-            "sections": round(float(sec_conf), 2),
-            "names": round(float(names_conf), 2),
-            "address": round(float(addr_conf), 2)
-        }
-    }
-    return result
-
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("FIR PII Extractor — Final (Fixed)")
-
-st.markdown(
-    "Upload a single FIR PDF (scan or digital). The tool uses PDF text-layer when available and EasyOCR fallback. "
-    "It returns per-field values with confidence and evidence. Edit fields and download final JSON."
-)
-
-uploaded = st.file_uploader("Upload FIR PDF", type=["pdf"])
-if uploaded:
-    pdf_bytes = uploaded.read()
-    with st.spinner("Running OCR + extraction (this can take a few seconds)..."):
-        try:
-            extracted = extract_from_pdf_bytes(pdf_bytes)
+                self.nlp_en = spacy.load("en_core_web_sm")
+            except OSError:
+                st.warning("English spaCy model not found. Using basic processing.")
+                self.nlp_en = None
+                
+            try:
+                self.nlp_hi = spacy.load("hi_core_news_sm")
+            except OSError:
+                st.warning("Hindi spaCy model not found. Using multilingual approach.")
+                self.nlp_hi = None
+            
+            # Sentence transformer for semantic similarity
+            self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            # Classification pipeline for legal text
+            self.classifier = pipeline(
+                "text-classification",
+                model="nlpaueb/legal-bert-base-uncased",
+                return_all_scores=True
+            )
+            
         except Exception as e:
-            st.error(f"Extraction failed: {e}")
-            raise
+            st.error(f"Error loading models: {e}")
+            self.ner_tokenizer = self.ner_model = None
+            self.nlp_en = self.nlp_hi = None
+    
+    def setup_indian_patterns(self):
+        """Setup patterns specific to Indian legal documents."""
+        self.legal_acts = {
+            'ipc': ['IPC', 'Indian Penal Code', 'भारतीय दंड संहिता', '1860'],
+            'crpc': ['CrPC', 'Code of Criminal Procedure', 'दंड प्रक्रिया संहिता', '1973'],
+            'evidence_act': ['Evidence Act', 'साक्ष्य अधिनियम', '1872'],
+            'domestic_violence': ['Domestic Violence Act', 'घरेलू हिंसा अधिनियम', '2005'],
+            'sc_st': ['SC/ST Act', 'अनुसूचित जाति अधिनियम', '1989'],
+            'pocso': ['POCSO', 'Protection of Children', '2012'],
+        }
+        
+        self.indian_states = [
+            'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh',
+            'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka',
+            'Kerala', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram',
+            'Nagaland', 'Odisha', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu',
+            'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
+            'Delhi', 'Jammu and Kashmir', 'Ladakh'
+        ]
+        
+        self.jurisdiction_types = [
+            'PAN_INDIA', 'STATE_LEVEL', 'DISTRICT_LEVEL', 'LOCAL', 'SPECIAL'
+        ]
+        
+        # Enhanced patterns for Indian names and addresses
+        self.name_indicators = [
+            'complainant', 'accused', 'victim', 'applicant', 'respondent',
+            'शिकायतकर्ता', 'आरोपी', 'पीड़ित', 'आवेदक'
+        ]
+        
+        self.address_indicators = [
+            'address', 'residence', 'village', 'district', 'pin', 'pincode',
+            'पता', 'निवास', 'गांव', 'जिला', 'पिन'
+        ]
 
-    st.success("Extraction finished — review outputs below.")
+    def extract_text_from_pdf(self, pdf_file) -> str:
+        """
+        Advanced PDF text extraction using multiple techniques.
+        """
+        text = ""
+        
+        try:
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(pdf_file.getvalue())
+                tmp_path = tmp_file.name
+            
+            # Method 1: PyMuPDF for direct text extraction
+            doc = fitz.open(tmp_path)
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text += page.get_text()
+            doc.close()
+            
+            # Method 2: OCR if direct extraction yields poor results
+            if len(text.strip()) < 100 or self.is_text_corrupted(text):
+                st.info("Direct extraction yielded poor results. Using OCR...")
+                text = self.ocr_extract_text(tmp_path)
+            
+            # Clean up
+            os.unlink(tmp_path)
+            
+        except Exception as e:
+            st.error(f"Error extracting text: {e}")
+            return ""
+        
+        return self.clean_extracted_text(text)
+    
+    def is_text_corrupted(self, text: str) -> bool:
+        """Check if extracted text is corrupted or contains too many special characters."""
+        if not text:
+            return True
+        
+        # Calculate ratio of alphanumeric characters
+        alphanumeric_count = sum(c.isalnum() for c in text)
+        total_count = len(text)
+        
+        if total_count == 0:
+            return True
+        
+        ratio = alphanumeric_count / total_count
+        return ratio < 0.5  # If less than 50% are alphanumeric, consider corrupted
+    
+    def ocr_extract_text(self, pdf_path: str) -> str:
+        """Extract text using OCR with support for multiple Indian languages."""
+        text = ""
+        
+        try:
+            # Convert PDF to images
+            doc = fitz.open(pdf_path)
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Higher resolution
+                img_data = pix.tobytes("png")
+                
+                # Convert to PIL Image
+                image = Image.open(io.BytesIO(img_data))
+                
+                # Preprocess image for better OCR
+                image = self.preprocess_image_for_ocr(image)
+                
+                # OCR with multiple languages
+                custom_config = r'--oem 3 --psm 6 -l eng+hin+ben+guj+pan+tel+tam+kan+mal+ori'
+                page_text = pytesseract.image_to_string(image, config=custom_config)
+                text += page_text + "\n"
+            
+            doc.close()
+            
+        except Exception as e:
+            st.error(f"OCR extraction failed: {e}")
+        
+        return text
+    
+    def preprocess_image_for_ocr(self, image):
+        """Preprocess image to improve OCR accuracy."""
+        # Convert PIL to OpenCV format
+        cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        
+        # Noise removal
+        denoised = cv2.fastNlMeansDenoising(gray)
+        
+        # Thresholding
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Morphological operations
+        kernel = np.ones((1, 1), np.uint8)
+        processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        
+        # Convert back to PIL
+        return Image.fromarray(processed)
+    
+    def clean_extracted_text(self, text: str) -> str:
+        """Clean and normalize extracted text."""
+        if not text:
+            return ""
+        
+        # Normalize unicode characters
+        text = unicodedata.normalize('NFKD', text)
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove special characters that might interfere with processing
+        text = re.sub(r'[^\w\s\-.,;:()\[\]{}\/\\@#$%^&*+=|~`<>?]', ' ', text)
+        
+        return text.strip()
+    
+    def detect_language(self, text: str) -> str:
+        """Detect the primary language of the text."""
+        try:
+            return detect(text)
+        except LangDetectError:
+            return 'unknown'
+    
+    def extract_pii_advanced(self, text: str) -> Dict[str, Any]:
+        """
+        Extract PII using advanced NLP techniques including:
+        - Named Entity Recognition
+        - Semantic similarity
+        - Context-aware extraction
+        - Legal document understanding
+        """
+        
+        results = {
+            'fir_no': None,
+            'year': None,
+            'state_name': None,
+            'dist_name': None,
+            'police_station': None,
+            'under_acts': [],
+            'under_sections': [],
+            'revised_case_category': None,
+            'oparty': [],
+            'names': [],
+            'addresses': [],
+            'jurisdiction': None,
+            'jurisdiction_type': None,
+            'confidence_scores': {}
+        }
+        
+        # Detect language
+        language = self.detect_language(text)
+        
+        # Choose appropriate NLP model
+        nlp_model = self.nlp_hi if language == 'hi' else self.nlp_en
+        if nlp_model is None:
+            # Fallback to multilingual approach
+            nlp_model = self.nlp_en if self.nlp_en else None
+        
+        # Extract using different techniques
+        results.update(self.extract_using_ner(text, nlp_model))
+        results.update(self.extract_using_patterns(text))
+        results.update(self.extract_using_semantic_similarity(text))
+        results.update(self.extract_legal_entities(text))
+        
+        # Post-process and validate results
+        results = self.validate_and_clean_results(results)
+        
+        return results
+    
+    def extract_using_ner(self, text: str, nlp_model) -> Dict[str, Any]:
+        """Extract entities using Named Entity Recognition."""
+        results = defaultdict(list)
+        
+        if nlp_model:
+            doc = nlp_model(text[:1000000])  # Limit text length for processing
+            
+            for ent in doc.ents:
+                if ent.label_ == "PERSON":
+                    results['names'].append(ent.text.strip())
+                elif ent.label_ in ["GPE", "LOC"]:
+                    # Could be state, district, or address
+                    if ent.text in self.indian_states:
+                        results['state_name'] = ent.text
+                    else:
+                        results['addresses'].append(ent.text.strip())
+                elif ent.label_ == "ORG":
+                    # Could be police station
+                    if any(keyword in ent.text.lower() for keyword in ['police', 'station', 'thana']):
+                        results['police_station'] = ent.text.strip()
+        
+        return dict(results)
+    
+    def extract_using_patterns(self, text: str) -> Dict[str, Any]:
+        """Extract information using intelligent pattern matching."""
+        results = {}
+        
+        # FIR Number extraction
+        fir_patterns = [
+            r'FIR\s*No\.?\s*:?\s*(\d+/\d+)',
+            r'प्राथमिकी\s*संख्या\s*:?\s*(\d+/\d+)',
+            r'Case\s*No\.?\s*:?\s*(\d+/\d+)',
+            r'मामला\s*संख्या\s*:?\s*(\d+/\d+)'
+        ]
+        
+        for pattern in fir_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                results['fir_no'] = match.group(1)
+                break
+        
+        # Year extraction
+        year_patterns = [
+            r'(\d{4})',  # Simple 4-digit year
+            r'Year\s*:?\s*(\d{4})',
+            r'वर्ष\s*:?\s*(\d{4})'
+        ]
+        
+        current_year = datetime.now().year
+        for pattern in year_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                year = int(match)
+                if 1900 <= year <= current_year:  # Valid year range
+                    results['year'] = year
+                    break
+            if 'year' in results:
+                break
+        
+        # Police Station extraction
+        ps_patterns = [
+            r'Police\s+Station\s*:?\s*([A-Za-z\s]+)',
+            r'थाना\s*:?\s*([A-Za-z\u0900-\u097F\s]+)',
+            r'P\.?S\.?\s*:?\s*([A-Za-z\s]+)'
+        ]
+        
+        for pattern in ps_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                results['police_station'] = match.group(1).strip()
+                break
+        
+        # Legal sections extraction
+        section_patterns = [
+            r'Section\s*(\d+(?:,\s*\d+)*)',
+            r'धारा\s*(\d+(?:,\s*\d+)*)',
+            r'u/s\s*(\d+(?:,\s*\d+)*)',
+            r'IPC\s*(\d+(?:,\s*\d+)*)'
+        ]
+        
+        sections = set()
+        for pattern in section_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                sections.update([s.strip() for s in match.split(',')])
+        
+        if sections:
+            results['under_sections'] = list(sections)
+        
+        return results
+    
+    def extract_using_semantic_similarity(self, text: str) -> Dict[str, Any]:
+        """Use semantic similarity to extract relevant information."""
+        results = {}
+        
+        # Split text into sentences
+        sentences = re.split(r'[।.!?]+', text)
+        sentence_embeddings = self.sentence_model.encode(sentences)
+        
+        # Define target concepts and their embeddings
+        target_concepts = {
+            'complainant_info': "complainant name address details",
+            'accused_info': "accused person name details",
+            'police_station': "police station thana jurisdiction",
+            'case_details': "case registered under sections acts"
+        }
+        
+        concept_embeddings = self.sentence_model.encode(list(target_concepts.values()))
+        
+        # Find most similar sentences for each concept
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        similarities = cosine_similarity(sentence_embeddings, concept_embeddings)
+        
+        for i, (concept, _) in enumerate(target_concepts.items()):
+            most_similar_idx = np.argmax(similarities[:, i])
+            similarity_score = similarities[most_similar_idx, i]
+            
+            if similarity_score > 0.5:  # Threshold for relevance
+                relevant_sentence = sentences[most_similar_idx]
+                results[f'{concept}_context'] = relevant_sentence
+                results[f'{concept}_confidence'] = float(similarity_score)
+        
+        return results
+    
+    def extract_legal_entities(self, text: str) -> Dict[str, Any]:
+        """Extract legal-specific entities and classifications."""
+        results = {'under_acts': []}
+        
+        # Identify legal acts
+        for act_type, variations in self.legal_acts.items():
+            for variation in variations:
+                if variation.lower() in text.lower():
+                    results['under_acts'].append(f"{act_type.upper()} - {variation}")
+        
+        # Case category classification using semantic analysis
+        case_categories = [
+            'theft', 'assault', 'domestic violence', 'fraud', 'murder',
+            'rape', 'kidnapping', 'robbery', 'cybercrime', 'corruption'
+        ]
+        
+        # Use the legal BERT model for classification
+        try:
+            if len(text) > 0:
+                classification_results = self.classifier(text[:512])  # BERT token limit
+                
+                # Find the most likely category
+                best_category = max(classification_results[0], key=lambda x: x['score'])
+                if best_category['score'] > 0.5:
+                    results['revised_case_category'] = best_category['label']
+                    results['category_confidence'] = best_category['score']
+        except Exception as e:
+            st.warning(f"Classification failed: {e}")
+        
+        # Jurisdiction detection
+        for jurisdiction in self.jurisdiction_types:
+            if jurisdiction.lower().replace('_', ' ') in text.lower():
+                results['jurisdiction_type'] = jurisdiction
+                break
+        else:
+            # Default jurisdiction logic
+            if any(state in text for state in self.indian_states):
+                results['jurisdiction_type'] = 'STATE_LEVEL'
+            else:
+                results['jurisdiction_type'] = 'LOCAL'
+        
+        return results
+    
+    def validate_and_clean_results(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and clean extracted results."""
+        
+        # Remove duplicates from lists
+        for key in ['names', 'addresses', 'under_acts', 'under_sections', 'oparty']:
+            if key in results and isinstance(results[key], list):
+                results[key] = list(set(results[key]))
+        
+        # Validate FIR number format
+        if results.get('fir_no'):
+            if not re.match(r'\d+/\d+', results['fir_no']):
+                results['fir_no'] = None
+        
+        # Validate year
+        if results.get('year'):
+            current_year = datetime.now().year
+            if not (1900 <= results['year'] <= current_year):
+                results['year'] = None
+        
+        # Clean names (remove common words that might be misidentified as names)
+        if results.get('names'):
+            stop_words = {'the', 'and', 'of', 'in', 'at', 'by', 'for', 'with'}
+            results['names'] = [name for name in results['names'] 
+                              if name.lower() not in stop_words and len(name) > 2]
+        
+        # Merge similar keys (consolidate oparty and names)
+        all_names = set()
+        if results.get('names'):
+            all_names.update(results['names'])
+        if results.get('oparty'):
+            all_names.update(results['oparty'])
+        
+        results['names'] = list(all_names)
+        results['oparty'] = list(all_names)  # Assuming opposite party is among the names
+        
+        return results
 
-    st.subheader("Detected metadata page (index)")
-    st.write(extracted.get("_meta", {}))
+def main():
+    st.set_page_config(
+        page_title="Advanced FIR PII Extraction Tool",
+        page_icon="🔍",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("🔍 Advanced FIR PII Extraction Tool")
+    st.markdown("""
+    This tool uses state-of-the-art NLP techniques to extract Personal Identifiable Information (PII) 
+    from FIR documents in multiple Indian languages.
+    
+    **Features:**
+    - Multi-language support (Hindi, English, and other Indian languages)
+    - Advanced OCR for scanned documents
+    - Named Entity Recognition (NER)
+    - Semantic similarity analysis
+    - Legal document understanding
+    - Context-aware extraction
+    """)
+    
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        confidence_threshold = st.slider(
+            "Confidence Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.1,
+            help="Minimum confidence score for extracted information"
+        )
+        
+        show_debug_info = st.checkbox(
+            "Show Debug Information",
+            help="Display additional processing details"
+        )
+        
+        export_format = st.selectbox(
+            "Export Format",
+            ["JSON", "CSV", "Excel"],
+            help="Choose export format for results"
+        )
+    
+    # Main content area
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.header("📄 Upload FIR Document")
+        
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file",
+            type=['pdf'],
+            help="Upload a PDF file containing FIR document"
+        )
+        
+        if uploaded_file is not None:
+            st.success(f"File uploaded: {uploaded_file.name}")
+            
+            # Initialize extractor
+            with st.spinner("Initializing advanced NLP models..."):
+                extractor = AdvancedFIRExtractor()
+            
+            if st.button("🚀 Extract PII Information", type="primary"):
+                with st.spinner("Processing document... This may take a few minutes."):
+                    
+                    # Extract text
+                    progress_bar = st.progress(0)
+                    st.info("Step 1/3: Extracting text from PDF...")
+                    progress_bar.progress(33)
+                    
+                    extracted_text = extractor.extract_text_from_pdf(uploaded_file)
+                    
+                    if not extracted_text:
+                        st.error("Failed to extract text from the PDF. Please check if the file is valid.")
+                        return
+                    
+                    # Show extracted text preview
+                    if show_debug_info:
+                        with st.expander("📋 Extracted Text Preview"):
+                            st.text_area(
+                                "First 1000 characters:",
+                                value=extracted_text[:1000],
+                                height=200
+                            )
+                    
+                    # Extract PII
+                    st.info("Step 2/3: Analyzing text and extracting PII...")
+                    progress_bar.progress(66)
+                    
+                    pii_results = extractor.extract_pii_advanced(extracted_text)
+                    
+                    progress_bar.progress(100)
+                    st.success("✅ Processing completed!")
+                    
+                    # Display results in the second column
+                    with col2:
+                        st.header("📊 Extraction Results")
+                        
+                        # Create results summary
+                        st.subheader("🎯 Key Information")
+                        
+                        key_info = {
+                            "FIR Number": pii_results.get('fir_no', 'Not found'),
+                            "Year": pii_results.get('year', 'Not found'),
+                            "State": pii_results.get('state_name', 'Not found'),
+                            "District": pii_results.get('dist_name', 'Not found'),
+                            "Police Station": pii_results.get('police_station', 'Not found'),
+                            "Jurisdiction Type": pii_results.get('jurisdiction_type', 'Not found')
+                        }
+                        
+                        for key, value in key_info.items():
+                            st.write(f"**{key}:** {value}")
+                        
+                        # Legal Information
+                        st.subheader("⚖️ Legal Information")
+                        
+                        if pii_results.get('under_acts'):
+                            st.write("**Acts:** " + ", ".join(pii_results['under_acts']))
+                        else:
+                            st.write("**Acts:** Not found")
+                            
+                        if pii_results.get('under_sections'):
+                            st.write("**Sections:** " + ", ".join(pii_results['under_sections']))
+                        else:
+                            st.write("**Sections:** Not found")
+                            
+                        if pii_results.get('revised_case_category'):
+                            st.write(f"**Case Category:** {pii_results['revised_case_category']}")
+                        else:
+                            st.write("**Case Category:** Not determined")
+                        
+                        # Personal Information
+                        st.subheader("👤 Personal Information")
+                        
+                        if pii_results.get('names'):
+                            st.write("**Names Found:**")
+                            for name in pii_results['names']:
+                                st.write(f"- {name}")
+                        else:
+                            st.write("**Names:** None found")
+                            
+                        if pii_results.get('addresses'):
+                            st.write("**Addresses Found:**")
+                            for address in pii_results['addresses']:
+                                st.write(f"- {address}")
+                        else:
+                            st.write("**Addresses:** None found")
+                        
+                        # Confidence Scores
+                        if show_debug_info and pii_results.get('confidence_scores'):
+                            st.subheader("📈 Confidence Scores")
+                            for key, score in pii_results['confidence_scores'].items():
+                                st.write(f"**{key}:** {score:.2f}")
+                        
+                        # Export functionality
+                        st.subheader("💾 Export Results")
+                        
+                        if export_format == "JSON":
+                            json_data = json.dumps(pii_results, indent=2, ensure_ascii=False)
+                            st.download_button(
+                                label="📥 Download JSON",
+                                data=json_data,
+                                file_name=f"fir_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json"
+                            )
+                        elif export_format == "CSV":
+                            # Flatten the results for CSV
+                            flat_results = {}
+                            for key, value in pii_results.items():
+                                if isinstance(value, list):
+                                    flat_results[key] = "; ".join(map(str, value))
+                                else:
+                                    flat_results[key] = str(value) if value is not None else ""
+                            
+                            df = pd.DataFrame([flat_results])
+                            csv_data = df.to_csv(index=False)
+                            st.download_button(
+                                label="📥 Download CSV",
+                                data=csv_data,
+                                file_name=f"fir_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                        
+                        # Display full results in expandable section
+                        with st.expander("🔍 View Full Results"):
+                            st.json(pii_results)
+    
+    # Instructions and tips
+    with st.expander("💡 Usage Tips and Requirements"):
+        st.markdown("""
+        ### System Requirements:
+        - Install required packages: `pip install streamlit PyMuPDF pytesseract pillow opencv-python spacy transformers torch sentence-transformers google-generativeai langdetect scikit-learn`
+        - Download spaCy models: `python -m spacy download en_core_web_sm hi_core_news_sm`
+        - Install Tesseract OCR with language packs
+        
+        ### Tips for Better Results:
+        - Upload clear, high-quality PDF files
+        - Ensure the document contains text (not just images)
+        - For scanned documents, higher resolution yields better OCR results
+        - The tool works best with standard FIR formats
+        
+        ### Supported Languages:
+        - English
+        - Hindi (हिंदी)
+        - Bengali (বাংলা)
+        - Gujarati (ગુજરાતી)
+        - Tamil (தமிழ்)
+        - Telugu (తెలుగు)
+        - Kannada (ಕನ್ನಡ)
+        - Malayalam (മലയാളം)
+        - Punjabi (ਪੰਜਾਬੀ)
+        - Odia (ଓଡ଼ିଆ)
+        """)
 
-    st.subheader("Extracted fields (editable)")
-    cols = st.columns([3,1,1])
-    edited = {}
-    with cols[0]:
-        edited["fir_no"] = st.text_input("FIR No", value=extracted.get("fir_no",""))
-        edited["date"] = st.text_input("Date (YYYY-MM-DD)", value=extracted.get("date",""))
-        edited["time"] = st.text_input("Time", value=extracted.get("time",""))
-        edited["police_station"] = st.text_input("Police Station", value=extracted.get("police_station",""))
-        edited["state_name"] = st.text_input("State", value=extracted.get("state_name",""))
-        edited["dist_name"] = st.text_input("District", value=extracted.get("dist_name",""))
-        edited["phone"] = st.text_input("Phone", value=extracted.get("phone",""))
-        edited["address"] = st.text_area("Address", value=extracted.get("address",""), height=100)
-        edited["under_sections"] = st.text_area("Under Sections (one per line)", value="\n".join(extracted.get("under_sections",[])), height=120)
-        edited["names"] = st.text_area("Names (one per line)", value="\n".join(extracted.get("names",[])), height=120)
-
-    with cols[1]:
-        st.subheader("Confidence")
-        st.json(extracted.get("_confidence", {}))
-        st.subheader("Evidence")
-        st.json(extracted.get("_evidence", {}))
-
-    with cols[2]:
-        st.subheader("Actions")
-        if st.button("Auto-normalize phone/date/sections"):
-            # phone normalization
-            p = edited.get("phone","")
-            digits = re.sub(r"[^\d]", "", p)
-            if len(digits) == 10:
-                edited["phone"] = "+91" + digits
-            elif len(digits) == 11 and digits.startswith("0"):
-                edited["phone"] = "+91" + digits[1:]
-            # date normalization
-            if edited.get("date"):
-                d = dateparser.parse(edited["date"], settings={"DATE_ORDER":"DMY"})
-                if d:
-                    edited["date"] = d.strftime("%Y-%m-%d")
-            # sections normalization
-            secs = [re.sub(r"[^\d]", "", s) for s in edited.get("under_sections","").splitlines()]
-            secs = [s for s in secs if s]
-            edited["under_sections"] = "\n".join(secs)
-            st.success("Auto-normalize applied.")
-
-        if st.button("Download final JSON"):
-            out = {
-                "fir_no": edited.get("fir_no",""),
-                "date": edited.get("date",""),
-                "time": edited.get("time",""),
-                "police_station": edited.get("police_station",""),
-                "state_name": edited.get("state_name",""),
-                "dist_name": edited.get("dist_name",""),
-                "phone": edited.get("phone",""),
-                "address": edited.get("address",""),
-                "under_sections": [s for s in edited.get("under_sections","").splitlines() if s.strip()],
-                "names": [s for s in edited.get("names","").splitlines() if s.strip()],
-                "_meta": extracted.get("_meta", {}),
-                "_evidence": extracted.get("_evidence", {}),
-                "_confidence": extracted.get("_confidence", {})
-            }
-            st.download_button("Download final JSON", json.dumps(out, ensure_ascii=False, indent=2),
-                               file_name="fir_pii_final.json", mime="application/json")
-else:
-    st.info("Upload one FIR PDF to run extraction. Use good-quality scans (>=300 DPI) for best OCR accuracy.")
+if __name__ == "__main__":
+    main()
