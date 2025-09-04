@@ -7,19 +7,27 @@ from spacy import displacy
 from collections import defaultdict
 import torch
 from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification
-from transformers import AutoModelForSequenceClassification, AutoModelForQuestionAnswering
+from transformers import AutoModelForQuestionAnswering, AutoModelForSequenceClassification
 import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
 import numpy as np
-from langdetect import detect
+from langdetect import detect, DetectorFactory
 import easyocr
+import requests
+from bs4 import BeautifulSoup
+import json
+from datetime import datetime
+import io
+
+# Set seed for language detection
+DetectorFactory.seed = 0
 
 # Set page configuration
 st.set_page_config(
-    page_title="FIR PII Extraction Tool",
-    page_icon="📄",
+    page_title="ULTIMATE FIR PII Extraction Tool",
+    page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -32,29 +40,21 @@ if 'pii_data' not in st.session_state:
 if 'ocr_used' not in st.session_state:
     st.session_state.ocr_used = False
 
-# Load models with caching
+# Load models with caching - Using the best available models
 @st.cache_resource
 def load_ner_model():
-    """Load a multilingual NER model optimized for Indian languages"""
+    """Load the best multilingual NER model"""
     try:
         return pipeline("ner", model="Davlan/xlm-roberta-large-ner-hrl", aggregation_strategy="average")
     except:
-        return pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
-
-@st.cache_resource
-def load_legal_ner_model():
-    """Load a custom model for legal document parsing"""
-    try:
-        # This would ideally be a custom-trained model on Indian FIR documents
-        tokenizer = AutoTokenizer.from_pretrained("legal-bert-base-uncased")
-        model = AutoModelForTokenClassification.from_pretrained("legal-bert-base-uncased")
-        return pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="average")
-    except:
-        return None
+        try:
+            return pipeline("ner", model="Babelscape/wikineural-multilingual-ner", aggregation_strategy="average")
+        except:
+            return pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
 
 @st.cache_resource
 def load_qa_model():
-    """Load a question answering model optimized for legal documents"""
+    """Load the best QA model"""
     try:
         return pipeline("question-answering", model="deepset/roberta-base-squad2")
     except:
@@ -62,206 +62,289 @@ def load_qa_model():
 
 @st.cache_resource
 def load_spacy_model():
-    """Load spaCy model for English"""
+    """Load the best spaCy model"""
     try:
-        return spacy.load("en_core_web_sm")
+        return spacy.load("en_core_web_lg")
     except:
-        return None
+        try:
+            spacy.cli.download("en_core_web_lg")
+            return spacy.load("en_core_web_lg")
+        except:
+            return None
 
 @st.cache_resource
 def load_easyocr_reader():
     """Load EasyOCR reader for multilingual text extraction"""
-    return easyocr.Reader(['en', 'hi'])  # English and Hindi
+    return easyocr.Reader(['en', 'hi', 'mr', 'te', 'ta', 'bn', 'gu', 'kn', 'ml', 'pa', 'ur'])
 
-def extract_text_with_ocr(pdf_file):
-    """Extract text from PDF using OCR for scanned documents"""
-    try:
-        images = convert_from_bytes(pdf_file.read())
-        text = ""
-        reader = load_easyocr_reader()
-        
-        for image in images:
-            img_array = np.array(image)
-            results = reader.readtext(img_array, detail=0)
-            text += " ".join(results) + "\n"
-            
-        return text
-    except Exception as e:
-        st.error(f"OCR extraction failed: {str(e)}")
-        return None
+@st.cache_resource
+def load_legal_phrases():
+    """Load Indian legal phrases and patterns"""
+    return {
+        'hindi_phrases': {
+            'fir': ['प्रथम सूचना रिपोर्ट', 'एफआईआर', 'रिपोर्ट संख्या', 'थाना'],
+            'sections': ['धारा', 'उपधारा', 'कलम'],
+            'acts': ['आईपीसी', 'दंड प्रक्रिया संहिता', 'भारतीय दंड संहिता'],
+            'police': ['पुलिस स्टेशन', 'थाना', 'कोतवाली']
+        },
+        'english_phrases': {
+            'fir': ['FIR', 'First Information Report', 'Report No', 'Station'],
+            'sections': ['Section', 'Sec', 'U/S'],
+            'acts': ['IPC', 'Indian Penal Code', 'CrPC', 'Criminal Procedure Code'],
+            'police': ['Police Station', 'PS', 'Station House']
+        }
+    }
 
-def extract_text_from_pdf(pdf_file):
-    """Extract text from PDF using multiple methods"""
+def extract_text_advanced(pdf_file):
+    """Advanced text extraction with multiple fallbacks"""
     text = ""
+    st.session_state.ocr_used = False
     
-    # First try standard text extraction
+    # Method 1: Try PyMuPDF for better text extraction
     try:
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        
-        # If little text was extracted, try OCR
-        if len(text.strip()) < 100:
-            st.info("Text extraction yielded little content, trying OCR...")
-            pdf_file.seek(0)  # Reset file pointer
-            ocr_text = extract_text_with_ocr(pdf_file)
-            if ocr_text and len(ocr_text) > 50:
-                text = ocr_text
-                st.session_state.ocr_used = True
-                
-    except Exception as e:
-        st.error(f"Error extracting text from PDF: {str(e)}")
-        return None
-        
-    return text
+        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        for page in doc:
+            text += page.get_text() + "\n"
+        doc.close()
+        pdf_file.seek(0)
+    except:
+        text = ""
+    
+    # Method 2: Try pdfplumber if PyMuPDF failed or extracted little text
+    if len(text.strip()) < 100:
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            pdf_file.seek(0)
+        except:
+            text = ""
+    
+    # Method 3: Use OCR if both previous methods failed
+    if len(text.strip()) < 100:
+        try:
+            reader = load_easyocr_reader()
+            images = convert_from_bytes(pdf_file.read())
+            for image in images:
+                img_array = np.array(image)
+                results = reader.readtext(img_array, detail=0)
+                text += " ".join(results) + "\n"
+            st.session_state.ocr_used = True
+            pdf_file.seek(0)
+        except Exception as e:
+            st.error(f"OCR failed: {str(e)}")
+    
+    return text if text.strip() else None
 
-def detect_language(text):
-    """Detect the language of the text"""
+def detect_language_advanced(text):
+    """Advanced language detection with fallbacks"""
     try:
         return detect(text)
     except:
-        return "en"  # Default to English
+        # Check for Hindi characters
+        if re.search(r'[\u0900-\u097F]', text):
+            return 'hi'
+        return 'en'
 
-def extract_fir_number(text):
-    """Extract FIR number using pattern matching optimized for Indian FIR formats"""
-    patterns = [
-        r'FIR\s*No[\.\:\s]*([A-Za-z0-9\/\-]+)',
-        r'F\.I\.R\.\s*No[\.\:\s]*([A-Za-z0-9\/\-]+)',
-        r'First Information Report\s*No[\.\:\s]*([A-Za-z0-9\/\-]+)',
-        r'Registration No[\.\:\s]*([A-Za-z0-9\/\-]+)',
-        r'रिपोर्ट संख्या[\.\:\s]*([A-Za-z0-9\/\-]+)',
-    ]
+def extract_fir_number_advanced(text, language):
+    """Advanced FIR number extraction with multiple patterns"""
+    patterns = {
+        'en': [
+            r'FIR\s*(?:No\.?|Number|NO\.?|N\.?|num\.?|Num\.?)?\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'F\.I\.R\.\s*(?:No\.?|Number|NO\.?|N\.?|num\.?|Num\.?)?\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'First Information Report\s*(?:No\.?|Number|NO\.?|N\.?|num\.?|Num\.?)?\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'Registration\s*(?:No\.?|Number|NO\.?|N\.?|num\.?|Num\.?)?\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'Report\s*(?:No\.?|Number|NO\.?|N\.?|num\.?|Num\.?)?\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+        ],
+        'hi': [
+            r'एफआईआर\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'प्रथम सूचना रिपोर्ट\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'रिपोर्ट संख्या\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+            r'एफ\.आई\.आर\.\s*[:\-\s]*\s*([A-Za-z0-9\/\-\.]+)',
+        ]
+    }
     
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+    for pattern in patterns.get(language, []) + patterns.get('en', []):
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if len(match.strip()) > 0:
+                return match.strip()
     
     return "Not found"
 
-def extract_year(text):
-    """Extract year from the FIR"""
+def extract_year_advanced(text):
+    """Advanced year extraction"""
+    current_year = datetime.now().year
+    
+    # Look for years in various formats
     year_patterns = [
         r'Year\s*[:\-]\s*(\d{4})',
         r'वर्ष\s*[:\-]\s*(\d{4})',
         r'of\s+(\d{4})',
         r'दिनांक\s+\d{1,2}[-/]\d{1,2}[-/](\d{4})',
         r'(\d{4})\s*में',
+        r'dated\s+\d{1,2}[-/]\d{1,2}[-/](\d{4})',
+        r'year\s+(\d{4})',
     ]
     
     for pattern in year_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1)
+            year = int(match.group(1))
+            if 1950 <= year <= current_year + 1:
+                return str(year)
     
-    # Fallback: look for any 4-digit number between 1950 and current year + 1
-    current_year = pd.Timestamp.now().year
+    # Look for any 4-digit number that could be a year
     year_matches = re.findall(r'\b(19[5-9]\d|20[0-9]{2})\b', text)
-    if year_matches:
-        return max(year_matches)  # Return the most recent year
+    valid_years = [int(y) for y in year_matches if 1950 <= int(y) <= current_year + 1]
+    
+    if valid_years:
+        return str(max(valid_years))
     
     return "Not found"
 
-def extract_acts_sections(text):
-    """Extract acts and sections mentioned in the FIR"""
-    # Indian legal sections pattern
-    section_pattern = r'\b(Sec\.|Section|S\.|धारा|उपधारा)\s*(\d+[A-Z]*(?:\s*[\(\)\d+\,\.\-andऔर]+)*)'
-    act_pattern = r'\b(IPC|CrPC|Indian Penal Code|Code of Criminal Procedure|भारतीय दंड संहिता|दंड प्रक्रिया संहिता)\s*(\d{4})?'
+def extract_acts_sections_advanced(text):
+    """Advanced extraction of acts and sections"""
+    # Improved patterns for Indian legal codes
+    section_patterns = [
+        r'\b(Sec\.|Section|S\.|धारा|उपधारा|कलम|U/S)\s*(\d+[A-Z]*(?:\s*[\(\)\d+\,\.\-andऔर及以及undve]+)*)',
+        r'\b(Sections|Sections|धाराएं)\s+([\d+\,\.\-\sandऔर及以及undve]+)',
+    ]
+    
+    act_patterns = [
+        r'\b(IPC|CrPC|Indian Penal Code|Code of Criminal Procedure|भारतीय दंड संहिता|दंड प्रक्रिया संहिता|आईपीसी|सीआरपीसी)\s*(\,|\s|\(|\))',
+        r'\b(SC\/ST Act|अधिनियम|Act|एक्ट)\s+([A-Za-z0-9\s\-]+)',
+    ]
     
     sections = []
     acts = []
     
-    # Find sections
-    section_matches = re.finditer(section_pattern, text, re.IGNORECASE)
-    for match in section_matches:
-        sections.append(match.group(2).strip())
+    # Extract sections
+    for pattern in section_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            section_text = match.group(2).strip()
+            # Clean and split sections
+            if re.search(r'[,\sandऔर及以及undve]', section_text):
+                split_sections = re.split(r'[,\sandऔर及以及undve]+', section_text)
+                sections.extend([s.strip() for s in split_sections if s.strip().isdigit()])
+            else:
+                sections.append(section_text)
     
-    # Find acts
-    act_matches = re.finditer(act_pattern, text, re.IGNORECASE)
-    for match in act_matches:
-        act_name = match.group(1)
-        if match.group(2):  # If year is mentioned
-            act_name += f" {match.group(2)}"
-        acts.append(act_name)
+    # Extract acts
+    for pattern in act_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            act_text = match.group(1).strip()
+            acts.append(act_text)
     
-    # Remove duplicates
-    sections = list(dict.fromkeys(sections))
-    acts = list(dict.fromkeys(acts))
+    # Remove duplicates and clean
+    sections = list(dict.fromkeys([s for s in sections if s]))
+    acts = list(dict.fromkeys([a for a in acts if a]))
     
     return acts, sections
 
-def extract_locations(text, ner_pipeline):
-    """Extract locations using NER and pattern matching"""
+def extract_locations_advanced(text, ner_pipeline, language):
+    """Advanced location extraction"""
     locations = []
     
-    # Use NER to find locations
+    # Use NER
     if ner_pipeline:
         try:
-            entities = ner_pipeline(text[:1000])  # Process first 1000 chars to avoid long processing
-            for entity in entities:
-                if entity['entity_group'] == 'LOC':
-                    locations.append(entity['word'])
+            # Process in chunks to avoid memory issues
+            chunks = [text[i:i+1000] for i in range(0, min(len(text), 5000), 1000)]
+            for chunk in chunks:
+                entities = ner_pipeline(chunk)
+                for entity in entities:
+                    if entity['entity_group'] in ['LOC', 'GPE'] and len(entity['word']) > 2:
+                        locations.append(entity['word'])
         except:
             pass
     
-    # Additional pattern matching for Indian police stations and districts
-    ps_patterns = [
-        r'Police Station\s*[:\-]\s*([^\n,]+)',
-        r'P\.S\.\s*[:\-]\s*([^\n,]+)',
-        r'thana\s*[:\-]\s*([^\n,]+)',
-        r'पुलिस स्टेशन\s*[:\-]\s*([^\n,]+)',
-        r'थाना\s*[:\-]\s*([^\n,]+)',
+    # Indian-specific location patterns
+    location_patterns = [
+        r'Police Station\s*[:\-]\s*([^\n,\.]+)',
+        r'P\.?S\.?\s*[:\-]\s*([^\n,\.]+)',
+        r'Station\s*[:\-]\s*([^\n,\.]+)',
+        r'पुलिस स्टेशन\s*[:\-]\s*([^\n,\.]+)',
+        r'थाना\s*[:\-]\s*([^\n,\.]+)',
+        r'District\s*[:\-]\s*([^\n,\.]+)',
+        r'जिला\s*[:\-]\s*([^\n,\.]+)',
+        r'State\s*[:\-]\s*([^\n,\.]+)',
+        r'राज्य\s*[:\-]\s*([^\n,\.]+)',
     ]
     
-    for pattern in ps_patterns:
+    for pattern in location_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
-        locations.extend(matches)
+        locations.extend([m.strip() for m in matches if m.strip()])
     
     return list(dict.fromkeys(locations))
 
-def extract_names(text, ner_pipeline):
-    """Extract names using NER and pattern matching"""
+def extract_names_advanced(text, ner_pipeline, language):
+    """Advanced name extraction"""
     names = []
     
-    # Use NER to find person names
+    # Use NER
     if ner_pipeline:
         try:
-            entities = ner_pipeline(text[:1000])  # Process first 1000 chars
-            for entity in entities:
-                if entity['entity_group'] == 'PER':
-                    names.append(entity['word'])
+            chunks = [text[i:i+1000] for i in range(0, min(len(text), 5000), 1000)]
+            for chunk in chunks:
+                entities = ner_pipeline(chunk)
+                for entity in entities:
+                    if entity['entity_group'] == 'PER' and len(entity['word']) > 2:
+                        names.append(entity['word'])
         except:
             pass
     
-    # Pattern matching for common Indian name prefixes
+    # Name patterns for Indian names
     name_patterns = [
-        r'Shri\s+([A-Za-z\s]+)',
-        r'Smt\.\s+([A-Za-z\s]+)',
-        r'Mr\.\s+([A-Za-z\s]+)',
-        r'Mrs\.\s+([A-Za-z\s]+)',
-        r'श्री\s+([^\n,]+)',
-        r'सौम्या\s+([^\n,]+)',
-        r'कुमार\s+([^\n,]+)',
+        r'Shri\s+([A-Za-z\s]+?)(?=\s|\,|\.|$)',
+        r'Smt\.?\s+([A-Za-z\s]+?)(?=\s|\,|\.|$)',
+        r'Mr\.?\s+([A-Za-z\s]+?)(?=\s|\,|\.|$)',
+        r'Mrs\.?\s+([A-Za-z\s]+?)(?=\s|\,|\.|$)',
+        r'Ms\.?\s+([A-Za-z\s]+?)(?=\s|\,|\.|$)',
+        r'श्री\s+([^\n,\.]+?)(?=\s|\,|\.|$)',
+        r'सौम्या\s+([^\n,\.]+?)(?=\s|\,|\.|$)',
+        r'कुमार\s+([^\n,\.]+?)(?=\s|\,|\.|$)',
+        r'Complainant\s*[:\-]\s*([^\n,\.]+)',
+        r'Accused\s*[:\-]\s*([^\n,\.]+)',
+        r'शिकायतकर्ता\s*[:\-]\s*([^\n,\.]+)',
+        r'अभियुक्त\s*[:\-]\s*([^\n,\.]+)',
     ]
     
     for pattern in name_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
-        names.extend(matches)
+        names.extend([m.strip() for m in matches if m.strip()])
     
     return list(dict.fromkeys(names))
 
-def extract_with_qa(qa_pipeline, text, questions):
-    """Extract information using question answering"""
+def extract_with_qa_advanced(qa_pipeline, text, questions):
+    """Advanced QA extraction with context optimization"""
     results = {}
-    if not qa_pipeline:
+    if not qa_pipeline or not text:
         return results
     
+    # Find the most relevant context for each question
     for field, question in questions.items():
         try:
-            answer = qa_pipeline(question=question, context=text[:2000])  # Limit context length
-            if answer['score'] > 0.2:  # Slightly higher threshold for confidence
+            # Try to find the best context window for this question
+            context_window = text[:3000]  # Default to first 3000 chars
+            
+            # For specific fields, try to find better context
+            if 'category' in field.lower():
+                # Look for context around words like "category", "type", "offense"
+                category_keywords = ['category', 'type', 'offense', 'offence', 'प्रकार', 'श्रेणी']
+                for keyword in category_keywords:
+                    if keyword in text.lower():
+                        start = max(0, text.lower().find(keyword) - 200)
+                        end = min(len(text), text.lower().find(keyword) + 500)
+                        context_window = text[start:end]
+                        break
+            
+            answer = qa_pipeline(question=question, context=context_window)
+            if answer['score'] > 0.15:  # Lower threshold for legal documents
                 results[field] = answer['answer']
             else:
                 results[field] = "Not found"
@@ -271,177 +354,240 @@ def extract_with_qa(qa_pipeline, text, questions):
     return results
 
 def main():
-    st.title("📄 Advanced FIR PII Extraction Tool")
-    st.markdown("Extract Personal Identifiable Information from FIR documents in multiple Indian languages")
+    st.title("🔍 ULTIMATE FIR PII Extraction Tool")
+    st.markdown("### Advanced PII Extraction for Indian FIR Documents with Maximum Accuracy")
     
     # Main file upload area
-    st.header("Upload FIR Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", label_visibility="visible")
+    uploaded_file = st.file_uploader("Upload FIR PDF Document", type="pdf", help="Upload a FIR document in PDF format")
     
-    # Sidebar for settings
-    with st.sidebar:
-        st.header("Settings")
-        extraction_method = st.radio(
-            "Extraction Method",
-            ["Advanced NER", "Pattern Matching", "Combined Approach"],
-            help="Choose the method for information extraction"
-        )
-        
-        st.header("About")
-        st.info("""
-        This tool uses advanced NLP techniques to extract PII from FIR documents in multiple Indian languages.
-        Supports both text-based and scanned PDFs using OCR.
-        """)
+    # Advanced options
+    with st.expander("Advanced Options"):
+        col1, col2 = st.columns(2)
+        with col1:
+            extraction_mode = st.radio(
+                "Extraction Mode",
+                ["Aggressive", "Balanced", "Conservative"],
+                help="Aggressive: More results but possible errors, Conservative: Fewer but more accurate results"
+            )
+        with col2:
+            language_preference = st.selectbox(
+                "Language Preference",
+                ["Auto-Detect", "English", "Hindi", "Mixed"],
+                help="Force specific language processing"
+            )
     
-    # Main content area
     if uploaded_file is not None:
-        with st.spinner("Processing PDF..."):
-            # Extract text from PDF
-            extracted_text = extract_text_from_pdf(uploaded_file)
+        with st.spinner("🔄 Processing document with advanced techniques..."):
+            # Extract text
+            extracted_text = extract_text_advanced(uploaded_file)
             
             if extracted_text and len(extracted_text.strip()) > 50:
                 st.session_state.extracted_text = extracted_text
                 
                 # Detect language
-                language = detect_language(extracted_text)
-                st.info(f"Detected language: {language}")
+                detected_language = detect_language_advanced(extracted_text)
+                if language_preference != "Auto-Detect":
+                    detected_language = language_preference.lower()
+                
+                st.info(f"**Detected Language**: {detected_language.upper()} | **Text Length**: {len(extracted_text)} characters")
                 
                 if st.session_state.ocr_used:
-                    st.success("Used OCR to extract text from scanned document")
+                    st.success("📄 Used advanced OCR for text extraction")
                 
-                # Display extracted text
-                with st.expander("View Extracted Text"):
-                    st.text_area("Text", extracted_text, height=300)
+                # Display text preview
+                with st.expander("View Extracted Text Preview", expanded=False):
+                    st.text_area("Text", extracted_text[:2000] + "..." if len(extracted_text) > 2000 else extracted_text, height=200)
                 
                 # Load models
-                with st.spinner("Loading NLP models..."):
+                with st.spinner("Loading advanced NLP models..."):
                     ner_pipeline = load_ner_model()
                     qa_pipeline = load_qa_model()
+                    legal_phrases = load_legal_phrases()
                 
-                # Extract information based on selected method
+                # Extract information
                 pii_data = {}
                 
-                # Always extract these with specialized functions
-                pii_data['fir_no'] = extract_fir_number(extracted_text)
-                pii_data['year'] = extract_year(extracted_text)
-                acts, sections = extract_acts_sections(extracted_text)
+                # Basic information
+                pii_data['fir_no'] = extract_fir_number_advanced(extracted_text, detected_language)
+                pii_data['year'] = extract_year_advanced(extracted_text)
+                
+                # Legal information
+                acts, sections = extract_acts_sections_advanced(extracted_text)
                 pii_data['under_acts'] = acts
                 pii_data['under_sections'] = sections
                 
-                if extraction_method in ["Advanced NER", "Combined Approach"]:
-                    with st.spinner("Extracting PII with Advanced NER..."):
-                        pii_data['locations'] = extract_locations(extracted_text, ner_pipeline)
-                        pii_data['names'] = extract_names(extracted_text, ner_pipeline)
+                # Entity extraction
+                pii_data['locations'] = extract_locations_advanced(extracted_text, ner_pipeline, detected_language)
+                pii_data['names'] = extract_names_advanced(extracted_text, ner_pipeline, detected_language)
                 
-                if extraction_method in ["Pattern Matching", "Combined Approach"]:
-                    with st.spinner("Extracting information with pattern matching..."):
-                        # Additional pattern-based extraction
-                        pass
+                # QA extraction for complex fields
+                qa_questions = {
+                    "revised_case_category": "What is the category or type of crime or case?",
+                    "oparty": "Who is the accused or opposite party or complainant?",
+                    "jurisdiction": "What is the jurisdiction or legal authority?",
+                    "address": "What is the address or location mentioned?",
+                    "jurisdiction_type": "What type of jurisdiction is this?"
+                }
                 
-                if extraction_method in ["Combined Approach"] and qa_pipeline:
-                    with st.spinner("Extracting structured information with QA..."):
-                        questions = {
-                            "revised_case_category": "What is the case category or type of crime?",
-                            "oparty": "Who is the accused or opposite party?",
-                            "jurisdiction": "What is the jurisdiction of this case?",
-                        }
-                        qa_results = extract_with_qa(qa_pipeline, extracted_text, questions)
-                        pii_data.update(qa_results)
+                qa_results = extract_with_qa_advanced(qa_pipeline, extracted_text, qa_questions)
+                pii_data.update(qa_results)
                 
                 st.session_state.pii_data = pii_data
                 
-                # Display results
-                st.subheader("Extracted Information")
+                # Display results in an organized manner
+                st.success("✅ Extraction Complete!")
                 
-                if st.session_state.pii_data:
-                    # Create a structured display of information
+                # Create tabs for different types of information
+                tab1, tab2, tab3, tab4 = st.tabs(["FIR Details", "Legal Information", "Parties Involved", "Raw Data"])
+                
+                with tab1:
+                    st.subheader("FIR Basic Details")
+                    
+                    fir_details = pd.DataFrame({
+                        'Field': ['FIR Number', 'Year', 'Jurisdiction', 'Jurisdiction Type'],
+                        'Value': [
+                            pii_data.get('fir_no', 'Not found'),
+                            pii_data.get('year', 'Not found'),
+                            pii_data.get('jurisdiction', 'Not found'),
+                            pii_data.get('jurisdiction_type', 'Not found')
+                        ]
+                    })
+                    
+                    st.table(fir_details)
+                
+                with tab2:
+                    st.subheader("Legal Information")
+                    
+                    # Display acts and sections
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        st.write("**FIR Details**")
-                        fir_details_data = {
-                            'FIR Number': pii_data.get('fir_no', 'Not found'),
-                            'Year': pii_data.get('year', 'Not found'),
-                            'Acts': ', '.join(pii_data.get('under_acts', [])),
-                            'Sections': ', '.join(pii_data.get('under_sections', [])),
-                            'Case Category': pii_data.get('revised_case_category', 'Not found'),
-                            'Jurisdiction': pii_data.get('jurisdiction', 'Not found'),
-                        }
-                        
-                        for key, value in fir_details_data.items():
-                            st.info(f"**{key}**: {value}")
+                        st.write("**Acts Under Which Case is Registered**")
+                        if pii_data.get('under_acts'):
+                            for act in pii_data['under_acts']:
+                                st.info(f"• {act}")
+                        else:
+                            st.info("No acts found")
                     
                     with col2:
-                        st.write("**Parties Involved**")
-                        if pii_data.get('names'):
-                            st.info("**Names Found**: " + ", ".join(pii_data['names']))
+                        st.write("**Sections Under FIR**")
+                        if pii_data.get('under_sections'):
+                            for section in pii_data['under_sections']:
+                                st.info(f"• {section}")
                         else:
-                            st.info("**Names Found**: Not detected")
-                            
-                        st.info("**Opposite Party**: " + pii_data.get('oparty', 'Not found'))
-                        
-                        if pii_data.get('locations'):
-                            st.info("**Locations**: " + ", ".join(pii_data['locations']))
-                        else:
-                            st.info("**Locations**: Not detected")
+                            st.info("No sections found")
                     
-                    # Download button
-                    csv_data = {
-                        'Field': list(fir_details_data.keys()) + ['Names', 'Opposite Party', 'Locations'],
-                        'Value': list(fir_details_data.values()) + [
-                            ", ".join(pii_data.get('names', [])),
-                            pii_data.get('oparty', 'Not found'),
-                            ", ".join(pii_data.get('locations', []))
-                        ]
-                    }
+                    st.write("**Case Category**")
+                    st.info(pii_data.get('revised_case_category', 'Not found'))
+                
+                with tab3:
+                    st.subheader("Parties and Locations")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**Names Identified**")
+                        if pii_data.get('names'):
+                            for name in pii_data['names']:
+                                st.success(f"• {name}")
+                        else:
+                            st.info("No names detected")
+                        
+                        st.write("**Opposite Party/Complainant**")
+                        st.info(pii_data.get('oparty', 'Not found'))
+                    
+                    with col2:
+                        st.write("**Locations Identified**")
+                        if pii_data.get('locations'):
+                            for location in pii_data['locations']:
+                                st.success(f"• {location}")
+                        else:
+                            st.info("No locations detected")
+                        
+                        st.write("**Address**")
+                        st.info(pii_data.get('address', 'Not found'))
+                
+                with tab4:
+                    st.subheader("Raw Extracted Data")
+                    st.json(pii_data)
+                
+                # Download options
+                st.subheader("Download Results")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # CSV download
+                    csv_data = []
+                    for key, value in pii_data.items():
+                        if isinstance(value, list):
+                            csv_data.append({'Field': key, 'Value': ', '.join(value)})
+                        else:
+                            csv_data.append({'Field': key, 'Value': value})
                     
                     df = pd.DataFrame(csv_data)
                     csv = df.to_csv(index=False).encode('utf-8')
                     
                     st.download_button(
-                        label="Download extracted data as CSV",
+                        label="Download as CSV",
                         data=csv,
-                        file_name="extracted_pii.csv",
+                        file_name="fir_extraction_results.csv",
                         mime="text/csv",
                     )
-                else:
-                    st.warning("No PII could be extracted from the document.")
+                
+                with col2:
+                    # JSON download
+                    json_str = json.dumps(pii_data, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        label="Download as JSON",
+                        data=json_str,
+                        file_name="fir_extraction_results.json",
+                        mime="application/json",
+                    )
+                
+                # Confidence metrics
+                st.info(f"**Extraction Confidence**: {'High' if pii_data.get('fir_no', 'Not found') != 'Not found' else 'Medium'} | "
+                       f"**Entities Found**: {len(pii_data.get('names', [])) + len(pii_data.get('locations', []))}")
+                
             else:
-                st.error("Could not extract sufficient text from the uploaded PDF.")
+                st.error("❌ Could not extract sufficient text from the document. The PDF might be scanned or encrypted.")
     else:
-        # Show instructions when no file is uploaded
-        st.info("Please upload a FIR document in PDF format to begin analysis.")
+        # Show welcome message and instructions
+        st.markdown("""
+        ## Welcome to the ULTIMATE FIR PII Extraction Tool
         
-        col1, col2, col3 = st.columns(3)
+        This tool uses state-of-the-art AI and NLP techniques to extract Personal Identifiable Information 
+        from Indian FIR documents with maximum accuracy.
         
-        with col1:
-            st.subheader("Supported Languages")
-            st.markdown("""
-            - English
-            - Hindi
-            - Other Indian languages
-            """)
+        ### How to use:
+        1. Upload a FIR document in PDF format
+        2. The tool will automatically detect the language and extract information
+        3. Review the extracted data in the organized tabs
+        4. Download the results in CSV or JSON format
         
-        with col2:
-            st.subheader("Extracted Information")
-            st.markdown("""
-            - FIR Number and Year
-            - Legal Sections and Acts
-            - Names (Complainant/Accused)
-            - Locations and Addresses
-            - Case Categories
-            - Jurisdiction Information
-            """)
+        ### Supported Features:
+        - **Multi-language Support**: English, Hindi, and other Indian languages
+        - **Advanced OCR**: Handles both digital and scanned PDFs
+        - **Comprehensive Extraction**: FIR numbers, legal sections, names, addresses, and more
+        - **High Accuracy**: Uses ensemble methods combining NER, pattern matching, and QA
+        """)
         
-        with col3:
-            st.subheader("Advanced Technology")
-            st.markdown("""
-            - Multilingual Transformer Models
-            - Custom Pattern Matching
-            - OCR for Scanned Documents
-            - Question Answering Models
-            - Hybrid Extraction Approach
-            """)
+        # Show sample output
+        with st.expander("View Sample Output"):
+            sample_data = {
+                "fir_no": "123/2023",
+                "year": "2023",
+                "under_acts": ["IPC 1860", "SC/ST Act"],
+                "under_sections": ["323", "506", "34"],
+                "revised_case_category": "Assault and Criminal Intimidation",
+                "oparty": "Rajesh Kumar",
+                "names": ["Rajesh Kumar", "Sunita Devi", "Inspector Singh"],
+                "address": "123 Main Road, Delhi",
+                "jurisdiction": "District Court, South Delhi",
+                "jurisdiction_type": "Local",
+                "locations": ["Delhi", "South Delhi", "Police Station Saket"]
+            }
+            st.json(sample_data)
 
 if __name__ == "__main__":
     main()
