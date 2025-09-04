@@ -5,3 +5,6 @@ numpy
 easyocr
 rapidfuzz
 dateparser
+json5
+transformers  # optional, only if you want HF NER fusion
+torch         # required by EasyOCR and optional HF models
