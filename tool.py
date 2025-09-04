@@ -770,7 +770,7 @@ class AdvancedFIRExtractor:
                 name = name.strip()
                 if (len(name) > 2 and len(name) < 50 and 
                     name.lower() not in stop_words and
-                    not re.match(r'^\d+, name)):  # Not just numbers
+                    not re.match(r'^\d+$', name):  # Not just numbers
                     cleaned_names.append(name)
             
             results['names'] = list(set(cleaned_names))[:10]  # Limit and deduplicate
