@@ -8,3 +8,4 @@ layoutparser[ocr]
 transformers
 torch
 sentencepiece
+json5
