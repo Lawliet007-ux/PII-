@@ -11,3 +11,5 @@ torch
 sentence-transformers
 google-generativeai
 langdetect
+pdfplumber  
+torch
