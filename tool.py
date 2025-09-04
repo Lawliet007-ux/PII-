@@ -26,7 +26,7 @@ try:
     import torch
     from sentence_transformers import SentenceTransformer
     import google.generativeai as genai
-    from langdetect import detect, LangDetectError
+    from langdetect import detect
     
     # Additional utilities
     import re
