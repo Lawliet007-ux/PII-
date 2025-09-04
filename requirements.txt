@@ -1,10 +1,10 @@
 streamlit
 PyMuPDF
 pdf2image
-opencv-python-headless
 numpy
+pillow
 paddleocr
-layoutparser[ocr]
+layoutparser
 transformers
 torch
 sentencepiece
