@@ -1,15 +1,16 @@
 streamlit
 pdfplumber
 pandas
+regex   # re is stdlib, but sometimes regex is needed for advanced patterns
 spacy
 torch
 transformers
-fitz
+PyMuPDF
 Pillow
 pytesseract
 pdf2image
 numpy
 langdetect
 easyocr
-python-multipart
-PyMuPDF
+requests
+beautifulsoup4
